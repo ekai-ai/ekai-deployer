@@ -19,7 +19,7 @@ services:
       retries: 5
 
   ekai-backend:
-    image: public.ecr.aws/s7m9t1b0/ekai-backend:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-backend:dev
     container_name: ekai-backend
     ports:
       - "3000:3000"
@@ -30,7 +30,7 @@ services:
         condition: service_healthy
 
   ekai-frontend:
-    image: public.ecr.aws/s7m9t1b0/ekai-frontend:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-frontend:dev
     container_name: ekai-frontend
     ports:
       - "80:80"
@@ -117,7 +117,7 @@ services:
 
   ekai-erd:
     platform: ${DOCKER_PLATFORM:-linux/amd64}
-    image: public.ecr.aws/s7m9t1b0/ekai-erd:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-erd:dev
     container_name: ekai-erd
     ports:
       - "9002:9002"
@@ -136,7 +136,7 @@ services:
 
   ekai-ai-core-worker:
     platform: ${DOCKER_PLATFORM:-linux/amd64}
-    image: public.ecr.aws/s7m9t1b0/ekai-erd:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-erd:dev
     container_name: ekai-ai-core-worker
     entrypoint:
       [
@@ -156,14 +156,12 @@ services:
       - AI_CORE__REDIS_DB=0
       - SKIP_CLOUDWATCH=true
       - EKAI_DEPLOY_TOKEN=
-      - EKAI_LICENSING_URL=
+      - EKAI_LICENSING_PORTAL_URL=
     volumes:
       - ai-core-workspaces:/app/workspaces
     depends_on:
       erd-redis-stack:
         condition: service_healthy
-      langfuse-web:
-        condition: service_started
     deploy:
       replicas: 1
       resources:
@@ -177,7 +175,7 @@ services:
 
   ekai-document-worker:
     platform: ${DOCKER_PLATFORM:-linux/amd64}
-    image: public.ecr.aws/s7m9t1b0/ekai-document-worker:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-document-worker:dev
     container_name: ekai-document-worker
     env_file:
       - .env
@@ -204,7 +202,7 @@ services:
 
   ekai-profile-worker:
     platform: ${DOCKER_PLATFORM:-linux/amd64}
-    image: public.ecr.aws/s7m9t1b0/ekai-profile-worker:latest
+    image: public.ecr.aws/s7m9t1b0/ekai-profile-worker:dev
     env_file:
       - .env
     environment:
