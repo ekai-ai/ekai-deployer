@@ -334,10 +334,9 @@ SQL
   fi
 
   echo ""
-  success "ekai is running!"
+  success "Ekai is running!"
   echo ""
-  echo "  ${bold}Platform UI:${reset}   http://localhost:80"
-  echo "  ${bold}AI Core API:${reset}   http://localhost:9002"
+  echo "  ${bold}Ekai:${reset}   http://localhost:80"
   echo ""
   echo "To stop:   ${bold}docker compose -f ${COMPOSE_FILE} --profile app down${reset}"
   echo "To update: ${bold}for s in \$(docker compose -f ${COMPOSE_FILE} --profile app config --services); do docker compose -f ${COMPOSE_FILE} --profile app pull \"\$s\"; done && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
