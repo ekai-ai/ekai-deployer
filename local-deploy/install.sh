@@ -263,11 +263,10 @@ deploy_local() {
   mv "$tmp" "$ENV_FILE"
   success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + DOCKER_PLATFORM set)"
 
-  # Pull images one at a time (COMPOSE_PARALLEL_LIMIT=1) so progress is easy to
-  # follow and we don't saturate bandwidth pulling everything at once.
+  # Pull images one at a time via the global --parallel flag.
   echo ""
   info "Pulling images…"
-  COMPOSE_PARALLEL_LIMIT=1 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app pull
+  docker compose --parallel 1 -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app pull
 
   # Bring up the stack
   echo ""
@@ -323,7 +322,7 @@ SQL
   echo "  ${bold}AI Core API:${reset}   http://localhost:9002"
   echo ""
   echo "To stop:   ${bold}docker compose -f ${COMPOSE_FILE} --profile app down${reset}"
-  echo "To update: ${bold}COMPOSE_PARALLEL_LIMIT=1 docker compose -f ${COMPOSE_FILE} --profile app pull && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
+  echo "To update: ${bold}docker compose --parallel 1 -f ${COMPOSE_FILE} --profile app pull && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
 }
 
 # ── Cloud deployment ──────────────────────────────────────────────────────────
