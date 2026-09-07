@@ -17,6 +17,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   ekai-backend:
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-backend:dev
@@ -28,6 +29,7 @@ services:
     depends_on:
       ekai-postgres:
         condition: service_healthy
+    restart: unless-stopped
 
   ekai-frontend:
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-frontend:dev
@@ -38,6 +40,7 @@ services:
       - .env
     depends_on:
       - ekai-backend
+    restart: unless-stopped
 
   # ─── AI-Core deps ────────────────────────────────────────────────────────────
 
@@ -57,6 +60,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
   erd-neo4j:
     image: neo4j:latest
@@ -76,7 +80,7 @@ services:
     ports:
       - "7474:7474"
       - "7687:7687"
-    restart: always
+    restart: unless-stopped
 
   langfuse-minio:
     image: minio/minio:latest
@@ -95,6 +99,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   minio-init:
     image: minio/mc:latest
