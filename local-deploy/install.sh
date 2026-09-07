@@ -263,10 +263,16 @@ deploy_local() {
   mv "$tmp" "$ENV_FILE"
   success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + DOCKER_PLATFORM set)"
 
-  # Pull images one at a time via the global --parallel flag.
+  # Pull images one at a time. --parallel is not available on all Compose
+  # versions (e.g. 2.3.3), so pull each service individually instead — this
+  # works everywhere and avoids bursting the registry's rate limit.
   echo ""
   info "Pulling images…"
-  docker compose --parallel 1 -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app pull
+  local svc
+  for svc in $(docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app config --services); do
+    info "Pulling ${svc}…"
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app pull "$svc"
+  done
 
   # Bring up the stack
   echo ""
@@ -322,7 +328,7 @@ SQL
   echo "  ${bold}AI Core API:${reset}   http://localhost:9002"
   echo ""
   echo "To stop:   ${bold}docker compose -f ${COMPOSE_FILE} --profile app down${reset}"
-  echo "To update: ${bold}docker compose --parallel 1 -f ${COMPOSE_FILE} --profile app pull && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
+  echo "To update: ${bold}for s in \$(docker compose -f ${COMPOSE_FILE} --profile app config --services); do docker compose -f ${COMPOSE_FILE} --profile app pull \"\$s\"; done && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
 }
 
 # ── Cloud deployment ──────────────────────────────────────────────────────────
