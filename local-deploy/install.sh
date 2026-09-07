@@ -289,7 +289,7 @@ deploy_local() {
   # Bring up the stack
   echo ""
   info "Starting ekai with Docker Compose…"
-  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app up -d
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app up -d --force-recreate
 
   # Seed the user account if we have an email
   if [ -n "$user_email" ]; then
