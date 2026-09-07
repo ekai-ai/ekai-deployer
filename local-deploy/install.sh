@@ -252,16 +252,28 @@ deploy_local() {
   cp "${ENV_FILE}.example" "$ENV_FILE"                     # commented out for local testing
   success "Downloaded ${ENV_FILE}.example"
 
-  # Inject / update EKAI_DEPLOY_TOKEN and DOCKER_PLATFORM
+  # ekai-erd's bash sandbox requires the Landlock LSM (Linux 5.13+). That's a
+  # kernel feature, not an architecture one — irrelevant to Intel vs Apple
+  # Silicon — but Docker Desktop's VM (macOS/Windows) doesn't expose it to
+  # containers regardless of host CPU. Only native Linux Docker Engine shares
+  # the host kernel directly, so only keep the sandbox required there.
+  local sandbox_required="true"
+  if [ "$(uname -s)" != "Linux" ]; then
+    sandbox_required="false"
+    warn "Non-Linux host detected — Landlock sandbox is unavailable under Docker Desktop, disabling SANDBOX_REQUIRED."
+  fi
+
+  # Inject / update EKAI_DEPLOY_TOKEN, DOCKER_PLATFORM, and SANDBOX_REQUIRED
   local tmp
   tmp=$(mktemp)
-  grep -v -E "^EKAI_DEPLOY_TOKEN=|^DOCKER_PLATFORM=" "$ENV_FILE" > "$tmp" || true
+  grep -v -E "^EKAI_DEPLOY_TOKEN=|^DOCKER_PLATFORM=|^SANDBOX_REQUIRED=" "$ENV_FILE" > "$tmp" || true
   {
     echo "EKAI_DEPLOY_TOKEN=${token}"
     echo "DOCKER_PLATFORM=${platform}"
+    echo "SANDBOX_REQUIRED=${sandbox_required}"
   } >> "$tmp"
   mv "$tmp" "$ENV_FILE"
-  success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + DOCKER_PLATFORM set)"
+  success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + DOCKER_PLATFORM + SANDBOX_REQUIRED set)"
 
   # Pull images one at a time. --parallel is not available on all Compose
   # versions (e.g. 2.3.3), so pull each service individually instead — this

@@ -130,6 +130,7 @@ services:
       - REDIS_PORT=6379
       - AI_CORE__REDIS_DB=0
       - SKIP_CLOUDWATCH=true
+      - SANDBOX_REQUIRED=${SANDBOX_REQUIRED:-true}
     depends_on:
       - erd-redis-stack
     restart: unless-stopped
