@@ -95,6 +95,12 @@ srv.serve_forever()
 PYEOF
   local py_pid=$!
 
+  # Make sure the callback server is always killed, even on Ctrl+C or early exit,
+  # so it doesn't linger holding CALLBACK_PORT. A custom INT/TERM trap suppresses
+  # bash's default terminate-on-signal behavior, so exit explicitly here too.
+  trap 'kill "$py_pid" 2>/dev/null || true; rm -f "$token_file"; exit 130' INT TERM
+  trap 'kill "$py_pid" 2>/dev/null || true; rm -f "$token_file"' EXIT
+
   # Give Python a moment to bind the port before opening the browser
   sleep 1
 
@@ -128,6 +134,7 @@ PYEOF
   done
   kill "$py_pid" 2>/dev/null || true
   rm -f "$token_file"
+  trap - EXIT INT TERM
 
   if [ -z "$exchange_token" ]; then
     warn "Did not receive token automatically." >/dev/tty
