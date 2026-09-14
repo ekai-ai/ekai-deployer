@@ -662,12 +662,12 @@ deploy_gcp() {
 
   if [ -f "$tfvars_file" ]; then
     warn "${tfvars_file} already exists."
-    printf "Overwrite it? [y/N]: " >/dev/tty
+    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
     local overwrite
     read -r overwrite </dev/tty
     case "$overwrite" in
-      y|Y|yes|Yes) ;;
-      *) info "Keeping existing ${tfvars_file}."; deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone"; return ;;
+      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone"; return ;;
+      *) ;;
     esac
   fi
 
@@ -679,10 +679,8 @@ deploy_gcp() {
     -e "s/^region     = \"us-east1\"/region     = \"${gcp_region}\"/" \
     -e "s/^env        = \"customer\"/env        = \"${gcp_env}\"/" \
     -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${gcp_dns_zone}\"/" \
-    -e "s/^cluster_name = \"ekai-customer-gke\"/cluster_name = \"ekai-${gcp_env}-gke\"/" \
     -e "s/^acme_email      = \"REPLACE_ME\"/acme_email      = \"${gcp_acme_email}\"/" \
     -e "s/^tls_secret_name = \"customer-wildcard-tls\"/tls_secret_name = \"${gcp_env}-wildcard-tls\"/" \
-    -e "s/^dns_zone_name = \"customer-zone\"/dns_zone_name = \"${gcp_env}-zone\"/" \
     "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
 
   {
