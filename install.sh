@@ -13,6 +13,8 @@ COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
 COMPOSE_FILE="docker-compose.yml"
+GCP_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-google-ekai/archive/refs/heads/main.tar.gz"
+GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
 
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -417,6 +419,383 @@ check_cloud_cli() {
   return 0
 }
 
+check_gcp_requirements() {
+  need terraform
+  # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
+  # cluster it just created — modern GKE requires this plugin for that
+  # rather than gcloud's older built-in auth, and kubectl fails with a
+  # cryptic error mid-deploy without it.
+  command -v gke-gcloud-auth-plugin &>/dev/null || die "Required tool not found: gke-gcloud-auth-plugin. Install it with: gcloud components install gke-gcloud-auth-plugin"
+}
+
+check_gcp_permissions() {
+  local project_id="$1"
+  # Permissions PERMISSIONS.md's 5 bootstrapping-identity roles resolve to
+  # (self-deploy.sh runs API enables/SA creation/IAM grants/state bucket
+  # setup under this identity, before ever touching Terraform):
+  #   serviceusage.serviceUsageAdmin  -> serviceusage.services.enable
+  #   iam.serviceAccountAdmin         -> iam.serviceAccounts.create
+  #   iam.serviceAccountKeyAdmin      -> iam.serviceAccountKeys.create
+  #   resourcemanager.projectIamAdmin -> resourcemanager.projects.setIamPolicy
+  #   storage.admin                   -> storage.buckets.create
+  #
+  # `gcloud projects test-iam-permissions` isn't a real CLI command — only
+  # the underlying testIamPermissions REST API is. Call it directly with
+  # curl (already required) using a gcloud-minted access token, rather than
+  # matching role names via get-iam-policy — that only sees direct role
+  # bindings, while this reports the actual effective permission regardless
+  # of whether it came from a direct role, a custom role, or a group/org
+  # -level grant. No jq dependency (that's self-deploy.sh's requirement to
+  # check, once it's actually running) — the response is simple enough to
+  # parse with grep.
+  local access_token
+  access_token=$(gcloud auth print-access-token 2>/dev/null || true)
+  [ -n "$access_token" ] || die "No active gcloud access token. Run: gcloud auth login"
+
+  local response
+  response=$(curl -s -X POST \
+    "https://cloudresourcemanager.googleapis.com/v3/projects/${project_id}:testIamPermissions" \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "Content-Type: application/json" \
+    -d '{"permissions": [
+      "serviceusage.services.enable",
+      "iam.serviceAccounts.create",
+      "iam.serviceAccountKeys.create",
+      "resourcemanager.projects.setIamPolicy",
+      "storage.buckets.create"
+    ]}')
+
+  if echo "$response" | grep -q '"error"'; then
+    error "GCP rejected the permission check for project ${project_id}:"
+    echo "$response" >&2
+    die "Check the project ID is correct and re-run."
+  fi
+
+  local granted
+  granted=$(echo "$response" | grep -o '"[a-zA-Z0-9_.]*"' | tr -d '"' | grep -v '^permissions$' || true)
+
+  local missing=""
+  local have=""
+  local perm
+  for perm in serviceusage.services.enable iam.serviceAccounts.create \
+              iam.serviceAccountKeys.create resourcemanager.projects.setIamPolicy \
+              storage.buckets.create; do
+    case "$granted" in
+      *"$perm"*) have="${have}  ${perm}\n" ;;
+      *) missing="${missing}  ${perm}\n" ;;
+    esac
+  done
+
+  if [ -n "$missing" ]; then
+    error "Your GCP identity is missing required permissions on ${project_id}:"
+    printf '%b' "$missing" >&2
+    if [ -n "$have" ]; then
+      echo "Permissions it does have:" >&2
+      printf '%b' "$have" >&2
+    else
+      echo "It has none of the required permissions." >&2
+    fi
+    die "See https://github.com/ekai-ai/terraform-google-ekai/blob/main/PERMISSIONS.md (\"Bootstrapping identity\") for the roles to grant, then re-run."
+  fi
+  success "GCP permissions verified on ${project_id}"
+}
+
+# Looks for local signs that a GCP deploy was previously started for some env
+# (a generated tfvars + deployer key or backend config) — this catches a
+# self-deploy.sh run that errored, timed out, or was interrupted partway, as
+# well as a run that finished cleanly. Prints the candidate env name on
+# stdout if found, empty otherwise. Deliberately doesn't try to tell those
+# cases apart (e.g. by reading Terraform output) — the user already saw that
+# run's logs and knows whether it succeeded better than any local-file/state
+# heuristic could; this only surfaces that artifacts exist so they can choose
+# to retry or start fresh.
+detect_gcp_partial_deploy() {
+  [ -d "$GCP_DEPLOY_DIR" ] || return 0
+  local tfvars_dir="${GCP_DEPLOY_DIR}/env"
+  [ -d "$tfvars_dir" ] || return 0
+
+  # Most-recently-modified non-template tfvars file is our one candidate —
+  # good enough for "did a previous run leave something behind", not meant
+  # to handle multiple concurrent in-progress envs.
+  local candidate
+  candidate=$(ls -t "${tfvars_dir}"/*.tfvars 2>/dev/null | grep -v '/customer\.tfvars$' | head -1 || true)
+  [ -n "$candidate" ] || return 0
+
+  local env_name
+  env_name=$(basename "$candidate" .tfvars)
+
+  local deployer_key="${GCP_DEPLOY_DIR}/.self-deploy/${env_name}-deployer-key.json"
+  local backend_file="${tfvars_dir}/backend-${env_name}.tfbackend"
+
+  # Deployer key or backend config existing means self-deploy.sh got at
+  # least as far as Step 2/3 — real signal something was attempted, not
+  # just a tfvars file the user hand-edited and never ran. Note the
+  # deployer key is meant to be deleted after copying it somewhere safe
+  # (self-deploy.sh says so at the end), so its absence alone doesn't mean
+  # anything — the backend file check covers that case.
+  [ -f "$deployer_key" ] || [ -f "$backend_file" ] || return 0
+
+  echo "$env_name"
+}
+
+deploy_gcp() {
+  local token="$1"
+
+  echo "" >/dev/tty
+  printf "GCP project ID: " >/dev/tty
+  local gcp_project_id=""
+  while [ -z "$gcp_project_id" ]; do
+    read -r gcp_project_id </dev/tty
+    [ -n "$gcp_project_id" ] || printf "GCP project ID (required): " >/dev/tty
+  done
+
+  check_gcp_permissions "$gcp_project_id"
+
+  printf "GCP region [us-east1]: " >/dev/tty
+  local gcp_region
+  read -r gcp_region </dev/tty
+  gcp_region="${gcp_region:-us-east1}"
+
+  echo "" >/dev/tty
+  warn "The environment name becomes part of every GCP resource this creates — it must be unique per deployment, and 13 characters or fewer (GCP service account IDs cap the room this leaves)." >/dev/tty
+  printf "Environment name [customer]: " >/dev/tty
+  local gcp_env
+  while :; do
+    read -r gcp_env </dev/tty
+    gcp_env="${gcp_env:-customer}"
+    if [ "${#gcp_env}" -gt 13 ]; then
+      printf "Environment name must be 13 characters or fewer (got %d): " "${#gcp_env}" >/dev/tty
+    else
+      break
+    fi
+  done
+
+  echo "" >/dev/tty
+  info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates a Cloud DNS zone under it, which you'll delegate to Google's nameservers at your registrar afterward." >/dev/tty
+  local gcp_dns_zone=""
+  printf "DNS zone (e.g. client1.ekai.ai): " >/dev/tty
+  while [ -z "$gcp_dns_zone" ]; do
+    read -r gcp_dns_zone </dev/tty
+    [ -n "$gcp_dns_zone" ] || printf "DNS zone (required): " >/dev/tty
+  done
+
+  echo "" >/dev/tty
+  info "acme_email is used by cert-manager to register a Let's Encrypt ACME account and issue the wildcard TLS certificate for your domain — registration fails without a real address." >/dev/tty
+  local gcp_acme_email=""
+  printf "ACME email: " >/dev/tty
+  while [ -z "$gcp_acme_email" ]; do
+    read -r gcp_acme_email </dev/tty
+    [ -n "$gcp_acme_email" ] || printf "ACME email (required): " >/dev/tty
+  done
+
+  echo "" >/dev/tty
+  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
+  info "Unrelated to the ACME/TLS setup above — this is a separate, optional choice about which service delivers app emails. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
+  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
+  local use_own_email
+  read -r use_own_email </dev/tty
+  local email_provider="licensing"
+  local sendgrid_api_key="" sendgrid_from_email=""
+  local ses_aws_region="" aws_access_key_id="" aws_secret_access_key="" aws_ses_from_email=""
+  case "$use_own_email" in
+    y|Y|yes|Yes)
+      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
+      printf "Which provider? [1/2]: " >/dev/tty
+      local email_choice
+      read -r email_choice </dev/tty
+      case "$email_choice" in
+        1|sendgrid|SendGrid)
+          email_provider="sendgrid"
+          printf "SendGrid API key: " >/dev/tty
+          while [ -z "$sendgrid_api_key" ]; do
+            read -r sendgrid_api_key </dev/tty
+            [ -n "$sendgrid_api_key" ] || printf "SendGrid API key (required): " >/dev/tty
+          done
+          printf "SendGrid from-email: " >/dev/tty
+          while [ -z "$sendgrid_from_email" ]; do
+            read -r sendgrid_from_email </dev/tty
+            [ -n "$sendgrid_from_email" ] || printf "SendGrid from-email (required): " >/dev/tty
+          done
+          ;;
+        2|ses|SES)
+          email_provider="ses"
+          printf "AWS SES region [us-east-1]: " >/dev/tty
+          read -r ses_aws_region </dev/tty
+          ses_aws_region="${ses_aws_region:-us-east-1}"
+          printf "AWS access key ID: " >/dev/tty
+          while [ -z "$aws_access_key_id" ]; do
+            read -r aws_access_key_id </dev/tty
+            [ -n "$aws_access_key_id" ] || printf "AWS access key ID (required): " >/dev/tty
+          done
+          printf "AWS secret access key: " >/dev/tty
+          while [ -z "$aws_secret_access_key" ]; do
+            read -r aws_secret_access_key </dev/tty
+            [ -n "$aws_secret_access_key" ] || printf "AWS secret access key (required): " >/dev/tty
+          done
+          printf "SES from-email: " >/dev/tty
+          while [ -z "$aws_ses_from_email" ]; do
+            read -r aws_ses_from_email </dev/tty
+            [ -n "$aws_ses_from_email" ] || printf "SES from-email (required): " >/dev/tty
+          done
+          ;;
+        *) die "Invalid choice: $email_choice" ;;
+      esac
+      ;;
+    *) : ;;
+  esac
+
+  if [ -d "$GCP_DEPLOY_DIR" ]; then
+    warn "${GCP_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
+  else
+    info "Downloading terraform-google-ekai…"
+    local tarball
+    tarball=$(mktemp)
+    curl -fsSL "$GCP_REPO_TARBALL_URL" -o "$tarball"
+    mkdir -p "$GCP_DEPLOY_DIR"
+    tar -xzf "$tarball" --strip-components=1 -C "$GCP_DEPLOY_DIR"
+    rm -f "$tarball"
+    success "Downloaded terraform-google-ekai"
+  fi
+
+  local tfvars_dir="${GCP_DEPLOY_DIR}/env"
+  local tfvars_file="${tfvars_dir}/${gcp_env}.tfvars"
+
+  if [ -f "$tfvars_file" ]; then
+    warn "${tfvars_file} already exists."
+    printf "Overwrite it? [y/N]: " >/dev/tty
+    local overwrite
+    read -r overwrite </dev/tty
+    case "$overwrite" in
+      y|Y|yes|Yes) ;;
+      *) info "Keeping existing ${tfvars_file}."; deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone"; return ;;
+    esac
+  fi
+
+  # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
+  # sed doesn't support it; it silently no-ops instead of erroring, which
+  # would leave every "customer" placeholder in place with no warning).
+  sed \
+    -e "s/^project_id = \"REPLACE_ME\".*/project_id = \"${gcp_project_id}\"/" \
+    -e "s/^region     = \"us-east1\"/region     = \"${gcp_region}\"/" \
+    -e "s/^env        = \"customer\"/env        = \"${gcp_env}\"/" \
+    -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${gcp_dns_zone}\"/" \
+    -e "s/^cluster_name = \"ekai-customer-gke\"/cluster_name = \"ekai-${gcp_env}-gke\"/" \
+    -e "s/^acme_email      = \"REPLACE_ME\"/acme_email      = \"${gcp_acme_email}\"/" \
+    -e "s/^tls_secret_name = \"customer-wildcard-tls\"/tls_secret_name = \"${gcp_env}-wildcard-tls\"/" \
+    -e "s/^dns_zone_name = \"customer-zone\"/dns_zone_name = \"${gcp_env}-zone\"/" \
+    "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
+
+  {
+    echo ""
+    echo "# Added by install.sh — trial deploy token + licensing portal, same values"
+    echo "# written to .env for the local Docker path."
+    echo "secret_value_overrides = {"
+    echo "  EKAI_DEPLOY_TOKEN         = \"${token}\""
+    echo "  EKAI_LICENSING_PORTAL_URL = \"${PORTAL_URL}\""
+    echo "  SKIP_CLOUDWATCH           = \"true\""
+    echo "  EMAIL_PROVIDER            = \"${email_provider}\""
+    case "$email_provider" in
+      sendgrid)
+        echo "  SENDGRID_API_KEY          = \"${sendgrid_api_key}\""
+        echo "  SENDGRID_FROM_EMAIL       = \"${sendgrid_from_email}\""
+        ;;
+      ses)
+        echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${aws_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        ;;
+    esac
+    echo "}"
+  } >> "$tfvars_file"
+  success "${tfvars_file} written"
+
+  deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone"
+}
+
+deploy_gcp_run() {
+  local gcp_project_id="$1"
+  local gcp_env="$2"
+  local gcp_dns_zone="$3"
+
+  echo ""
+  info "Ready to deploy to GCP project ${gcp_project_id} (env=${gcp_env})."
+  info "This runs terraform-google-ekai/scripts/self-deploy.sh, which will:"
+  echo "  - enable required GCP APIs"
+  echo "  - create a scoped deployer service account"
+  echo "  - run 2 terraform applies (creates real, billable GCP resources)"
+  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh "$gcp_env" )
+
+  # Read back from Terraform state rather than reconstructing the URL
+  # ourselves — this is exactly what got deployed (works the same whether
+  # this run just applied it or is re-picking-up an existing deployment),
+  # and matches self-deploy.sh's own cicd_provider == "none" conditional
+  # without duplicating that logic here. A non-empty raw portal_url is also
+  # the signal that the cicd apply actually completed (it only exists once
+  # that state has been applied).
+  #
+  # The state backend is a GCS bucket, so reading it needs GCP credentials.
+  # self-deploy.sh only exports GOOGLE_APPLICATION_CREDENTIALS for its own
+  # process (the deployer SA key it mints) — that doesn't survive past the
+  # subshell above, so `terraform output` here would otherwise silently fail
+  # (swallowed by `2>/dev/null || true`) using our own gcloud user auth,
+  # which was never granted access to that bucket. Reuse the same deployer
+  # key file self-deploy.sh already wrote to disk.
+  local deployer_key
+  deployer_key="$(cd "$(dirname "${GCP_DEPLOY_DIR}/.self-deploy/${gcp_env}-deployer-key.json")" && pwd)/${gcp_env}-deployer-key.json"
+
+  local portal_url_raw
+  portal_url_raw=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/cicd" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw portal_url 2>/dev/null || true)
+  local portal_url="${portal_url_raw:-https://portal.${gcp_dns_zone}}"
+
+  local ingress_ip
+  ingress_ip=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw nginx_ingress_ip 2>/dev/null || true)
+
+  local name_servers
+  name_servers=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -json name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
+
+  echo ""
+  success "Ekai is running!"
+  echo ""
+  if [ -n "$ingress_ip" ]; then
+    echo "  ${bold}Ekai:${reset}   ${portal_url}   (${ingress_ip})"
+    echo ""
+    echo "  Note: ${ingress_ip} is the ingress's IP, shown for reference (e.g. to sanity-check DNS once it propagates) —"
+    echo "  it isn't verified reachable from outside GCP, since that depends on firewall rules this doesn't configure."
+  else
+    echo "  ${bold}Ekai:${reset}   ${portal_url}"
+  fi
+
+  if [ -n "$name_servers" ]; then
+    echo ""
+    echo "  ${bold}Before ${gcp_dns_zone} works:${reset} delegate it to these nameservers at your domain registrar"
+    echo "  (or parent DNS zone) — add an NS record for ${gcp_dns_zone} pointing at each:"
+    echo "$name_servers" | sed 's/^/    /'
+    echo "  (shown with GCP's trailing dot — your registrar may not want it in the NS record;"
+    echo "  check its own docs/UI to confirm whether to include or drop it.)"
+    echo "  DNS propagation can take anywhere from a few minutes to a few hours. Until it's"
+    echo "  done, the wildcard TLS cert can't be issued either — the URL above will fail or"
+    echo "  show a certificate warning in the meantime."
+  fi
+
+  if [ -n "$portal_url_raw" ]; then
+    local argocd_url
+    argocd_url=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw argocd_url 2>/dev/null || true)
+    if [ -n "$argocd_url" ]; then
+      echo ""
+      if [ -n "$ingress_ip" ]; then
+        echo "  ${bold}ArgoCD:${reset} ${argocd_url}   (${ingress_ip})"
+      else
+        echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
+      fi
+      echo "  (user: admin, password:"
+      echo "    cd ${GCP_DEPLOY_DIR}/examples/self-deploy/root"
+      echo "    GOOGLE_APPLICATION_CREDENTIALS=${deployer_key} terraform output -raw argocd_admin_password_plaintext)"
+    fi
+  fi
+  echo ""
+}
+
 deploy_cloud() {
   local token="$1"
   local provider="$2"
@@ -454,6 +833,37 @@ main() {
   echo "────────────────────"
   echo ""
 
+  # Check for leftover artifacts from a previous GCP deploy run before asking
+  # anything else — resuming skips straight past the docker/cloud choice and
+  # every prompt in deploy_gcp, since all of that is already answered in the
+  # env's existing tfvars. Deliberately doesn't try to guess whether that
+  # prior run succeeded, failed, or is still stuck — the user already saw its
+  # logs and knows better than any local-file heuristic could.
+  local partial_env
+  partial_env=$(detect_gcp_partial_deploy)
+  if [ -n "$partial_env" ]; then
+    echo "" >/dev/tty
+    warn "Found previous run artifacts for GCP env '${partial_env}'." >/dev/tty
+    printf "Retry that deploy, or start a new one? [retry/new] " >/dev/tty
+    local resume_choice
+    read -r resume_choice </dev/tty
+    case "$resume_choice" in
+      r|R|retry|Retry)
+        check_gcp_requirements
+        local tfvars_dir="${GCP_DEPLOY_DIR}/env"
+        local tfvars_file="${tfvars_dir}/${partial_env}.tfvars"
+        local resume_project_id
+        local resume_dns_zone
+        resume_project_id=$(grep -E '^project_id[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+        resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+        [ -n "$resume_project_id" ] || die "Could not read project_id back from ${tfvars_file} — fix or delete it and start a new deployment."
+        deploy_gcp_run "$resume_project_id" "$partial_env" "$resume_dns_zone"
+        return
+        ;;
+      *) info "Starting a new deployment." ;;
+    esac
+  fi
+
   # Get deploy token + user email via browser login
   local token_output
   token_output=$(get_token_via_browser)
@@ -477,16 +887,15 @@ main() {
       deploy_cloud "$token" "other"
     else
       if check_cloud_cli "$provider"; then
-        deploy_cloud "$token" "$provider"
+        if [ "$provider" = "gcp" ]; then
+          check_gcp_requirements
+          deploy_gcp "$token"
+        else
+          deploy_cloud "$token" "$provider"
+        fi
       else
         echo ""
-        warn "CLI check failed. You can still proceed manually."
-        printf "Continue anyway? [y/N]: " >/dev/tty
-        read -r cont </dev/tty
-        case "$cont" in
-          y|Y|yes|Yes) deploy_cloud "$token" "$provider" ;;
-          *) info "Exiting. Fix your CLI auth and re-run the installer."; exit 0 ;;
-        esac
+        die "CLI check failed. Fix your CLI auth and re-run the installer."
       fi
     fi
   fi
