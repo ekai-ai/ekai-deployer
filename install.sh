@@ -752,6 +752,18 @@ deploy_gcp_run() {
   local name_servers
   name_servers=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -json name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
 
+  # self-deploy.sh exits 0 whether the user actually ran the Terraform apply
+  # or answered "N" to its confirmation and skipped it entirely — an empty
+  # portal_url_raw AND no ingress_ip means nothing was actually deployed
+  # this run (either skipped outright, or it failed before either apply
+  # produced an output), so don't claim success.
+  if [ -z "$portal_url_raw" ] && [ -z "$ingress_ip" ]; then
+    echo ""
+    warn "Terraform wasn't applied — nothing was deployed this run."
+    info "Re-run install.sh and choose retry for env '${gcp_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
+    return
+  fi
+
   echo ""
   success "Ekai is running!"
   echo ""
