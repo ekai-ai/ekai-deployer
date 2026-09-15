@@ -854,11 +854,11 @@ main() {
   if [ -n "$partial_env" ]; then
     echo "" >/dev/tty
     warn "Found previous run artifacts for GCP env '${partial_env}'." >/dev/tty
-    printf "Retry that deploy, or start a new one? [retry/new] " >/dev/tty
+    printf "Retry that deploy instead of starting a new one? [y/N] " >/dev/tty
     local resume_choice
     read -r resume_choice </dev/tty
     case "$resume_choice" in
-      r|R|retry|Retry)
+      y|Y|yes|Yes)
         check_gcp_requirements
         local tfvars_dir="${GCP_DEPLOY_DIR}/env"
         local tfvars_file="${tfvars_dir}/${partial_env}.tfvars"
