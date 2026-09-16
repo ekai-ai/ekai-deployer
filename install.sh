@@ -265,17 +265,19 @@ deploy_local() {
     warn "Non-Linux host detected — Landlock sandbox is unavailable under Docker Desktop, disabling SANDBOX_REQUIRED."
   fi
 
-  # Inject / update EKAI_DEPLOY_TOKEN, DOCKER_PLATFORM, and SANDBOX_REQUIRED
+  # Inject / update EKAI_DEPLOY_TOKEN, EKAI_LICENSING_PORTAL_URL,
+  # DOCKER_PLATFORM, and SANDBOX_REQUIRED.
   local tmp
   tmp=$(mktemp)
-  grep -v -E "^EKAI_DEPLOY_TOKEN=|^DOCKER_PLATFORM=|^SANDBOX_REQUIRED=" "$ENV_FILE" > "$tmp" || true
+  grep -v -E "^EKAI_DEPLOY_TOKEN=|^EKAI_LICENSING_PORTAL_URL=|^DOCKER_PLATFORM=|^SANDBOX_REQUIRED=" "$ENV_FILE" > "$tmp" || true
   {
     echo "EKAI_DEPLOY_TOKEN=${token}"
+    echo "EKAI_LICENSING_PORTAL_URL=${PORTAL_URL}"
     echo "DOCKER_PLATFORM=${platform}"
     echo "SANDBOX_REQUIRED=${sandbox_required}"
   } >> "$tmp"
   mv "$tmp" "$ENV_FILE"
-  success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + DOCKER_PLATFORM + SANDBOX_REQUIRED set)"
+  success "${ENV_FILE} updated (EKAI_DEPLOY_TOKEN + EKAI_LICENSING_PORTAL_URL + DOCKER_PLATFORM + SANDBOX_REQUIRED set)"
 
   # Pull images one at a time. --parallel is not available on all Compose
   # versions (e.g. 2.3.3), so pull each service individually instead — this
