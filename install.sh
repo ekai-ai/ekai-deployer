@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ekai trial installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | sh
+# Ekai deployer
+# Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
 PORTAL_URL="https://staging.licensing.ekai.ai"  # production default — uncomment for prod
@@ -41,11 +41,32 @@ case "$(uname -s)" in
 esac
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
+# need() records a missing tool instead of dying immediately, so a batch of
+# independent checks (e.g. all GCP prereqs) can run to completion and report
+# everything that's missing — each with how to install it — in one go, rather
+# than stopping at the first. Each miss is warned inline (with remediation) as
+# it's found; fail_if_missing_tools just dies afterward without repeating it.
+# Usage: need <tool> [remediation text]
+_missing_tools=""
 need() {
-  command -v "$1" &>/dev/null || die "Required tool not found: $1. Please install it and re-run."
+  local tool="$1"
+  local remediation="${2:-Please install it and re-run.}"
+  command -v "$tool" &>/dev/null || {
+    warn "Required tool not found: ${tool}. ${remediation}"
+    _missing_tools="${_missing_tools} ${tool}"
+    return 1
+  }
+  return 0
 }
 
-need curl
+fail_if_missing_tools() {
+  [ -z "$_missing_tools" ] || die "Missing required tools:${_missing_tools}. Install them (see above) and re-run."
+}
+
+reset_missing_tools() { _missing_tools=""; }
+
+need curl "Install it with: brew install curl (macOS) or apt-get install curl / yum install curl (Linux)."
+fail_if_missing_tools
 
 # ── Step 1: get deploy token via browser login ─────────────────────────────────
 get_token_via_browser() {
@@ -115,6 +136,14 @@ PYEOF
     open "$portal_page"
   elif command -v xdg-open &>/dev/null; then
     xdg-open "$portal_page"
+  elif command -v wslview &>/dev/null; then
+    # WSL2: xdg-open needs a desktop environment stock WSL2 doesn't have.
+    # wslview (from the `wslu` package) hands the URL to the Windows side instead.
+    wslview "$portal_page"
+  elif command -v powershell.exe &>/dev/null; then
+    # WSL2 fallback when wslu isn't installed — powershell.exe is on PATH by
+    # default and can launch the Windows default browser directly.
+    powershell.exe /c start "$portal_page" &>/dev/null
   else
     warn "Could not open browser automatically. Please open the URL above manually." >/dev/tty
   fi
@@ -196,20 +225,29 @@ detect_arch() {
 }
 
 check_local_requirements() {
-  need docker
+  reset_missing_tools
+  need docker "Install Docker Desktop from https://www.docker.com/products/docker-desktop/ (on WSL2, install it on Windows and enable WSL2 integration for this distro in Docker Desktop → Settings → Resources → WSL Integration)."
+  fail_if_missing_tools
 
-  # Docker running?
+  # Docker running? This gates every other check below (they all shell out
+  # to `docker info`), so it still has to fail fast on its own.
   docker info &>/dev/null || die "Docker is not running. Please start Docker Desktop and re-run."
   success "Docker is running"
 
-  # Available disk space >= 8 GB (in the Docker VM / current mount)
+  # Remaining checks are independent of each other — run them all and only
+  # report the disk-space failure (the one that's fatal) after the rest.
+  local disk_ok=1
+
+  # Available disk space >= 3 GB (in the Docker VM / current mount)
   local free_kb
   free_kb=$(df -Pk . | awk 'NR==2 {print $4}')
   local free_gb=$(( free_kb / 1024 / 1024 ))
   if [ "$free_gb" -lt 3 ]; then
-    die "Not enough disk space: ${free_gb} GB free, 3 GB required. Free up space and re-run."
+    error "Not enough disk space: ${free_gb} GB free, 3 GB required."
+    disk_ok=0
+  else
+    success "Disk space: ${free_gb} GB free"
   fi
-  success "Disk space: ${free_gb} GB free"
 
   # CPUs available to Docker >= 6
   local cpus
@@ -231,6 +269,8 @@ check_local_requirements() {
   else
     success "Docker memory: ${mem_gb} GB"
   fi
+
+  [ "$disk_ok" -eq 1 ] || die "Free up disk space and re-run."
 }
 
 deploy_local() {
@@ -422,12 +462,47 @@ check_cloud_cli() {
 }
 
 check_gcp_requirements() {
-  need terraform
+  reset_missing_tools
+  need terraform "Install it with: brew install terraform (macOS) — see https://developer.hashicorp.com/terraform/install for Linux package manager commands."
   # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
   # cluster it just created — modern GKE requires this plugin for that
   # rather than gcloud's older built-in auth, and kubectl fails with a
   # cryptic error mid-deploy without it.
-  command -v gke-gcloud-auth-plugin &>/dev/null || die "Required tool not found: gke-gcloud-auth-plugin. Install it with: gcloud components install gke-gcloud-auth-plugin"
+  need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
+  fail_if_missing_tools
+}
+
+# Runs every independent GCP prerequisite check (gcloud CLI + auth, terraform,
+# gke-gcloud-auth-plugin) in one pass and reports all failures together,
+# instead of stopping at whichever check happens to run first.
+check_gcp_prereqs() {
+  local ok=1
+
+  if command -v gcloud &>/dev/null; then
+    success "gcloud CLI found: $(gcloud --version 2>/dev/null | head -1)"
+    info "Checking GCP credentials…"
+    if gcloud auth print-access-token &>/dev/null; then
+      success "GCP credentials valid"
+      gcloud config list account --format 'value(core.account)' 2>/dev/null
+    else
+      warn "gcloud found but not authenticated. Run: gcloud auth login"
+      ok=0
+    fi
+  else
+    warn "gcloud CLI not found. Install it from https://cloud.google.com/sdk/docs/install"
+    ok=0
+  fi
+
+  reset_missing_tools
+  need terraform "Install it with: brew install terraform (macOS) — see https://developer.hashicorp.com/terraform/install for Linux package manager commands."
+  # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
+  # cluster it just created — modern GKE requires this plugin for that
+  # rather than gcloud's older built-in auth, and kubectl fails with a
+  # cryptic error mid-deploy without it.
+  need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
+  [ -z "$_missing_tools" ] || ok=0
+
+  [ "$ok" -eq 1 ]
 }
 
 check_gcp_permissions() {
@@ -687,7 +762,7 @@ deploy_gcp() {
 
   {
     echo ""
-    echo "# Added by install.sh — trial deploy token + licensing portal, same values"
+    echo "# Added by install.sh — deploy token + licensing portal, same values"
     echo "# written to .env for the local Docker path."
     echo "secret_value_overrides = {"
     echo "  EKAI_DEPLOY_TOKEN         = \"${token}\""
@@ -812,7 +887,7 @@ deploy_cloud() {
   local token="$1"
   local provider="$2"
 
-  need helm
+  need helm "Install it from https://helm.sh/docs/intro/install/."
 
   # Write token to env file regardless
   local tmp
@@ -841,7 +916,7 @@ deploy_cloud() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   echo ""
-  echo "${bold}${cyan}ekai trial installer${reset}"
+  echo "${bold}${cyan}Ekai deployer${reset}"
   echo "────────────────────"
   echo ""
 
@@ -897,14 +972,19 @@ main() {
 
     if [ "$provider" = "other" ]; then
       deploy_cloud "$token" "other"
+    elif [ "$provider" = "gcp" ]; then
+      # Run every independent GCP prereq (gcloud CLI/auth, terraform,
+      # gke-gcloud-auth-plugin) in one batch so a single missing tool
+      # doesn't stop the rest from being checked and reported.
+      if check_gcp_prereqs; then
+        deploy_gcp "$token"
+      else
+        echo ""
+        die "One or more GCP prerequisites are missing. Fix the issues above and re-run."
+      fi
     else
       if check_cloud_cli "$provider"; then
-        if [ "$provider" = "gcp" ]; then
-          check_gcp_requirements
-          deploy_gcp "$token"
-        else
-          deploy_cloud "$token" "$provider"
-        fi
+        deploy_cloud "$token" "$provider"
       else
         echo ""
         die "CLI check failed. Fix your CLI auth and re-run the installer."
