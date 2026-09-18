@@ -78,7 +78,11 @@ get_token_via_browser() {
   local token_file
   token_file=$(mktemp)
 
-  python3 - "$CALLBACK_PORT" "$token_file" <<'PYEOF' &
+  # Redirected: this runs in the background for the rest of the function, and
+  # get_token_via_browser's stdout is captured wholesale by the caller — an
+  # unexpected traceback or warning from this process would otherwise land in
+  # the token value instead of the terminal.
+  python3 - "$CALLBACK_PORT" "$token_file" <<'PYEOF' &>/dev/null &
 import sys, json, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -222,7 +226,7 @@ detect_arch() {
     arm64|aarch64)  echo "linux/arm64" ;;
     x86_64|amd64)   echo "linux/amd64" ;;
     *)
-      warn "Unknown architecture: $arch — defaulting to linux/amd64"
+      warn "Unknown architecture: $arch — defaulting to linux/amd64" >/dev/tty
       echo "linux/amd64"
       ;;
   esac
