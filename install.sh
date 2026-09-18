@@ -6,9 +6,9 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
-PORTAL_URL="https://staging.licensing.ekai.ai"  # production default — uncomment for prod
+PORTAL_URL="https://licensing.ekai.ai"  # production default — uncomment for prod
 CALLBACK_PORT="${EKAI_CALLBACK_PORT:-9999}"
-BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/staging"
+BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main"
 COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
