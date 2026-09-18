@@ -132,14 +132,18 @@ PYEOF
   echo "  ${bold}${portal_page}${reset}" >/dev/tty
   echo "" >/dev/tty
 
+  # get_token_via_browser's stdout is captured wholesale by the caller (as
+  # the deploy token), so every one of these must have its own stdout/stderr
+  # redirected away — e.g. linux `xdg-open` prints "Opening in existing browser
+  # session." to stdout, which would otherwise land in the token value.
   if command -v open &>/dev/null; then
-    open "$portal_page"
+    open "$portal_page" &>/dev/null
   elif command -v xdg-open &>/dev/null; then
-    xdg-open "$portal_page"
+    xdg-open "$portal_page" &>/dev/null
   elif command -v wslview &>/dev/null; then
     # WSL2: xdg-open needs a desktop environment stock WSL2 doesn't have.
     # wslview (from the `wslu` package) hands the URL to the Windows side instead.
-    wslview "$portal_page"
+    wslview "$portal_page" &>/dev/null
   elif command -v powershell.exe &>/dev/null; then
     # WSL2 fallback when wslu isn't installed — powershell.exe is on PATH by
     # default and can launch the Windows default browser directly.
