@@ -65,6 +65,109 @@ fail_if_missing_tools() {
 
 reset_missing_tools() { _missing_tools=""; }
 
+# ── Auto-install ──────────────────────────────────────────────────────────────
+detect_pkg_manager() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    command -v brew &>/dev/null && { echo "brew"; return; }
+  else
+    command -v apt-get &>/dev/null && { echo "apt-get"; return; }
+    command -v dnf &>/dev/null && { echo "dnf"; return; }
+    command -v yum &>/dev/null && { echo "yum"; return; }
+  fi
+  echo "none"
+}
+
+# Per-tool, per-package-manager install commands for the GCP deploy path
+# (gcloud, terraform, kubectl, gke-gcloud-auth-plugin, jq, dig). Binary name
+# doesn't always match package name (e.g. `dig` ships in `dnsutils`/`bind-utils`),
+# and gcloud/terraform aren't in the default apt/yum repos, so each needs its
+# own real install command rather than a generic "<pkg-manager> install <tool>".
+# Usage: install_cmd_for <tool> <pkg-manager> — prints the command, or nothing
+# if there's no known auto-install path for that combination.
+install_cmd_for() {
+  local tool="$1" mgr="$2"
+  case "${tool}:${mgr}" in
+    gcloud:brew)
+      echo "brew install --cask google-cloud-sdk" ;;
+    gcloud:apt-get)
+      echo 'curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list && sudo apt-get update && sudo apt-get install -y google-cloud-cli' ;;
+    gcloud:dnf|gcloud:yum)
+      echo "sudo ${mgr} install -y google-cloud-cli" ;;
+    terraform:brew)
+      echo "brew tap hashicorp/tap && brew install hashicorp/tap/terraform" ;;
+    terraform:apt-get)
+      echo 'curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg && echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list && sudo apt-get update && sudo apt-get install -y terraform' ;;
+    terraform:dnf|terraform:yum)
+      echo "sudo ${mgr} install -y -q dnf-plugins-core 2>/dev/null; sudo ${mgr} config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo; sudo ${mgr} install -y terraform" ;;
+    kubectl:brew)
+      echo "brew install kubectl" ;;
+    kubectl:apt-get|kubectl:dnf|kubectl:yum)
+      # Installed as a gcloud component instead of via the package manager —
+      # simpler than adding the separate Kubernetes apt/yum repo, and this
+      # box already needs gcloud for the GCP path anyway.
+      echo "gcloud components install kubectl --quiet" ;;
+    gke-gcloud-auth-plugin:*)
+      echo "gcloud components install gke-gcloud-auth-plugin --quiet" ;;
+    jq:brew)
+      echo "brew install jq" ;;
+    jq:apt-get)
+      echo "sudo apt-get install -y jq" ;;
+    jq:dnf|jq:yum)
+      echo "sudo ${mgr} install -y jq" ;;
+    dig:brew)
+      echo "brew install bind" ;;
+    dig:apt-get)
+      echo "sudo apt-get install -y dnsutils" ;;
+    dig:dnf|dig:yum)
+      echo "sudo ${mgr} install -y bind-utils" ;;
+  esac
+}
+
+# Offers to auto-install every tool in $_missing_tools, once, with a single
+# y/N prompt — rather than asking per-tool, which would be tedious when
+# several are missing at once (the common case on a fresh machine). Anything
+# that installs successfully is removed from $_missing_tools; anything that
+# fails, or that the user declines, is left for the caller's existing
+# fail_if_missing_tools / manual-instructions path to report.
+offer_auto_install_missing_tools() {
+  [ -n "$_missing_tools" ] || return 0
+
+  local mgr
+  mgr=$(detect_pkg_manager)
+  if [ "$mgr" = "none" ]; then
+    warn "No supported package manager found (brew/apt-get/dnf/yum) — can't auto-install."
+    return 0
+  fi
+
+  echo "" >/dev/tty
+  echo "${bold}Missing tools:${reset}${_missing_tools}" >/dev/tty
+  printf "Try to install these automatically now (using %s)? [Y/n]: " "$mgr" >/dev/tty
+  local answer
+  read -r answer </dev/tty
+  case "$answer" in
+    n|N|no|No) return 0 ;;
+  esac
+
+  local still_missing="" tool cmd
+  for tool in $_missing_tools; do
+    cmd=$(install_cmd_for "$tool" "$mgr")
+    if [ -z "$cmd" ]; then
+      warn "No known auto-install command for ${tool} on ${mgr}."
+      still_missing="${still_missing} ${tool}"
+      continue
+    fi
+    info "Installing ${tool}: ${cmd}"
+    if eval "$cmd" </dev/tty && command -v "$tool" &>/dev/null; then
+      success "${tool} installed"
+    else
+      error "Failed to install ${tool}."
+      still_missing="${still_missing} ${tool}"
+    fi
+  done
+
+  _missing_tools="$still_missing"
+}
+
 need curl "Install it with: brew install curl (macOS) or apt-get install curl / yum install curl (Linux)."
 fail_if_missing_tools
 
@@ -461,7 +564,7 @@ check_cloud_cli() {
           return 1
         fi
       else
-        warn "gcloud CLI not found. Install it from https://cloud.google.com/sdk/docs/install"
+        warn "gcloud CLI not found. Install it from https://cloud.google.com/sdk/docs/install (on Windows, install it inside WSL following the Linux instructions)"
         return 1
       fi
       ;;
@@ -469,22 +572,55 @@ check_cloud_cli() {
   return 0
 }
 
-check_gcp_requirements() {
+# Checks every tool the GCP deploy path needs (gcloud, terraform, kubectl,
+# gke-gcloud-auth-plugin, jq, dig), offers to auto-install whatever's missing,
+# and reports anything still missing afterward — all before asking any of
+# deploy_gcp's project/region/env/dns_zone questions, so a failure here isn't
+# discovered only after the user has already answered all of those.
+check_gcp_tools() {
   reset_missing_tools
-  need terraform "Install it with: brew install terraform (macOS) — see https://developer.hashicorp.com/terraform/install for Linux package manager commands."
+  need gcloud "Install it from https://cloud.google.com/sdk/docs/install (on Windows, install it inside WSL following the Linux instructions)."
+  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
   # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
   # cluster it just created — modern GKE requires this plugin for that
   # rather than gcloud's older built-in auth, and kubectl fails with a
   # cryptic error mid-deploy without it.
-  need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
+  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
+  # gke-gcloud-auth-plugin is a gcloud component — installing it first
+  # requires gcloud itself, so only attempt it once gcloud is confirmed
+  # present (either found already, or just auto-installed above).
+  if command -v gcloud &>/dev/null; then
+    need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
+  fi
+  # self-deploy.sh itself needs `jq` to parse gcloud/kubectl JSON output.
+  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
+  # self-deploy.sh polls DNS (via `dig`) to confirm the domain's name servers
+  # have propagated before continuing.
+  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
+
+  offer_auto_install_missing_tools
+
+  # gke-gcloud-auth-plugin couldn't even be checked above if gcloud was
+  # missing at that point — check it now if gcloud just got auto-installed.
+  if command -v gcloud &>/dev/null && ! command -v gke-gcloud-auth-plugin &>/dev/null; then
+    need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
+    offer_auto_install_missing_tools
+  fi
+}
+
+check_gcp_requirements() {
+  check_gcp_tools
   fail_if_missing_tools
 }
 
-# Runs every independent GCP prerequisite check (gcloud CLI + auth, terraform,
-# gke-gcloud-auth-plugin) in one pass and reports all failures together,
-# instead of stopping at whichever check happens to run first.
+# Runs every independent GCP prerequisite check (tools, gcloud auth) in one
+# pass and reports all failures together, instead of stopping at whichever
+# check happens to run first.
 check_gcp_prereqs() {
   local ok=1
+
+  check_gcp_tools
+  [ -z "$_missing_tools" ] || ok=0
 
   if command -v gcloud &>/dev/null; then
     success "gcloud CLI found: $(gcloud --version 2>/dev/null | head -1)"
@@ -496,19 +632,7 @@ check_gcp_prereqs() {
       warn "gcloud found but not authenticated. Run: gcloud auth login"
       ok=0
     fi
-  else
-    warn "gcloud CLI not found. Install it from https://cloud.google.com/sdk/docs/install"
-    ok=0
   fi
-
-  reset_missing_tools
-  need terraform "Install it with: brew install terraform (macOS) — see https://developer.hashicorp.com/terraform/install for Linux package manager commands."
-  # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
-  # cluster it just created — modern GKE requires this plugin for that
-  # rather than gcloud's older built-in auth, and kubectl fails with a
-  # cryptic error mid-deploy without it.
-  need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
-  [ -z "$_missing_tools" ] || ok=0
 
   [ "$ok" -eq 1 ]
 }
@@ -530,9 +654,9 @@ check_gcp_permissions() {
   # matching role names via get-iam-policy — that only sees direct role
   # bindings, while this reports the actual effective permission regardless
   # of whether it came from a direct role, a custom role, or a group/org
-  # -level grant. No jq dependency (that's self-deploy.sh's requirement to
-  # check, once it's actually running) — the response is simple enough to
-  # parse with grep.
+  # -level grant. Doesn't need jq itself (the response is simple enough to
+  # parse with grep) even though jq is checked as a prereq elsewhere for
+  # self-deploy.sh, which needs it once it's actually running.
   local access_token
   access_token=$(gcloud auth print-access-token 2>/dev/null || true)
   [ -n "$access_token" ] || die "No active gcloud access token. Run: gcloud auth login"
@@ -658,7 +782,7 @@ deploy_gcp() {
   echo "" >/dev/tty
   info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates a Cloud DNS zone under it, which you'll delegate to Google's nameservers at your registrar afterward." >/dev/tty
   local gcp_dns_zone=""
-  printf "DNS zone (e.g. client1.ekai.ai): " >/dev/tty
+  printf "DNS zone (e.g. example.com): " >/dev/tty
   while [ -z "$gcp_dns_zone" ]; do
     read -r gcp_dns_zone </dev/tty
     [ -n "$gcp_dns_zone" ] || printf "DNS zone (required): " >/dev/tty
@@ -759,6 +883,16 @@ deploy_gcp() {
   # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
   # sed doesn't support it; it silently no-ops instead of erroring, which
   # would leave every "customer" placeholder in place with no warning).
+  #
+  # Written to a temp file first, not straight to "$tfvars_file": when
+  # gcp_env is "customer" (the default — just pressing Enter at the prompt),
+  # tfvars_file IS customer.tfvars, the same file sed reads from below. A
+  # direct `> "$tfvars_file"` redirect truncates that file before sed ever
+  # reads it, so sed's input is empty and it silently produces nothing —
+  # destroying the template in the process. mv only replaces the target
+  # after sed has fully read its input.
+  local tfvars_tmp
+  tfvars_tmp=$(mktemp)
   sed \
     -e "s/^project_id = \"REPLACE_ME\".*/project_id = \"${gcp_project_id}\"/" \
     -e "s/^region     = \"us-east1\"/region     = \"${gcp_region}\"/" \
@@ -766,7 +900,8 @@ deploy_gcp() {
     -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${gcp_dns_zone}\"/" \
     -e "s/^acme_email      = \"REPLACE_ME\"/acme_email      = \"${gcp_acme_email}\"/" \
     -e "s/^tls_secret_name = \"customer-wildcard-tls\"/tls_secret_name = \"${gcp_env}-wildcard-tls\"/" \
-    "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
+    "${tfvars_dir}/customer.tfvars" > "$tfvars_tmp"
+  mv "$tfvars_tmp" "$tfvars_file"
 
   {
     echo ""
@@ -982,8 +1117,8 @@ main() {
       deploy_cloud "$token" "other"
     elif [ "$provider" = "gcp" ]; then
       # Run every independent GCP prereq (gcloud CLI/auth, terraform,
-      # gke-gcloud-auth-plugin) in one batch so a single missing tool
-      # doesn't stop the rest from being checked and reported.
+      # kubectl, gke-gcloud-auth-plugin, jq, dig) in one batch so a single
+      # missing tool doesn't stop the rest from being checked and reported.
       if check_gcp_prereqs; then
         deploy_gcp "$token"
       else
