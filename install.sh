@@ -767,12 +767,15 @@ deploy_gcp() {
 
   echo "" >/dev/tty
   warn "The environment name becomes part of every GCP resource this creates — it must be unique per deployment, and 13 characters or fewer (GCP service account IDs cap the room this leaves)." >/dev/tty
-  printf "Environment name [customer]: " >/dev/tty
   local gcp_env
   while :; do
+    printf "Environment name: " >/dev/tty
     read -r gcp_env </dev/tty
-    gcp_env="${gcp_env:-customer}"
-    if [ "${#gcp_env}" -gt 13 ]; then
+    if [ -z "$gcp_env" ]; then
+      printf "Environment name is required: " >/dev/tty
+    elif [ "$gcp_env" = "customer" ]; then
+      warn "\"customer\" is reserved (it's the template file itself) — pick a different environment name." >/dev/tty
+    elif [ "${#gcp_env}" -gt 13 ]; then
       printf "Environment name must be 13 characters or fewer (got %d): " "${#gcp_env}" >/dev/tty
     else
       break
@@ -883,16 +886,6 @@ deploy_gcp() {
   # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
   # sed doesn't support it; it silently no-ops instead of erroring, which
   # would leave every "customer" placeholder in place with no warning).
-  #
-  # Written to a temp file first, not straight to "$tfvars_file": when
-  # gcp_env is "customer" (the default — just pressing Enter at the prompt),
-  # tfvars_file IS customer.tfvars, the same file sed reads from below. A
-  # direct `> "$tfvars_file"` redirect truncates that file before sed ever
-  # reads it, so sed's input is empty and it silently produces nothing —
-  # destroying the template in the process. mv only replaces the target
-  # after sed has fully read its input.
-  local tfvars_tmp
-  tfvars_tmp=$(mktemp)
   sed \
     -e "s/^project_id = \"REPLACE_ME\".*/project_id = \"${gcp_project_id}\"/" \
     -e "s/^region     = \"us-east1\"/region     = \"${gcp_region}\"/" \
@@ -900,8 +893,7 @@ deploy_gcp() {
     -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${gcp_dns_zone}\"/" \
     -e "s/^acme_email      = \"REPLACE_ME\"/acme_email      = \"${gcp_acme_email}\"/" \
     -e "s/^tls_secret_name = \"customer-wildcard-tls\"/tls_secret_name = \"${gcp_env}-wildcard-tls\"/" \
-    "${tfvars_dir}/customer.tfvars" > "$tfvars_tmp"
-  mv "$tfvars_tmp" "$tfvars_file"
+    "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
 
   {
     echo ""
