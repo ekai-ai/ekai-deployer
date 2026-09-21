@@ -6,9 +6,9 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
-PORTAL_URL="https://dev.licensing.ekai.ai"  # production default — uncomment for prod
+PORTAL_URL="https://staging.licensing.ekai.ai"  # production default — uncomment for prod
 CALLBACK_PORT="${EKAI_CALLBACK_PORT:-9999}"
-BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/dev"
+BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/staging"
 COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
@@ -934,7 +934,7 @@ deploy_gcp_run() {
   echo "  - enable required GCP APIs"
   echo "  - create a scoped deployer service account"
   echo "  - run 2 terraform applies (creates real, billable GCP resources)"
-  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh "$gcp_env" )
+  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$gcp_env" )
 
   # Read back from Terraform state rather than reconstructing the URL
   # ourselves — this is exactly what got deployed (works the same whether
@@ -954,12 +954,24 @@ deploy_gcp_run() {
   local deployer_key
   deployer_key="$(cd "$(dirname "${GCP_DEPLOY_DIR}/.self-deploy/${gcp_env}-deployer-key.json")" && pwd)/${gcp_env}-deployer-key.json"
 
-  local portal_url_raw
-  portal_url_raw=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/cicd" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw portal_url 2>/dev/null || true)
+  # Captures stderr instead of discarding it (previously `2>/dev/null`) so
+  # that when an output comes back empty, the actual Terraform error (wrong
+  # backend/state, auth failure, apply that didn't run, ...) is visible below
+  # instead of silently falling through to "nothing was deployed this run".
+  local tf_err_file
+  tf_err_file=$(mktemp)
+
+  local portal_url_raw portal_url_err
+  portal_url_raw=$( (cd "${GCP_DEPLOY_DIR}/examples/self-deploy/cicd" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw portal_url) 2>"$tf_err_file" || true)
+  portal_url_err=$(cat "$tf_err_file")
   local portal_url="${portal_url_raw:-https://portal.${gcp_dns_zone}}"
 
-  local ingress_ip
-  ingress_ip=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw nginx_ingress_ip 2>/dev/null || true)
+  local ingress_ip_raw ingress_ip_err
+  ingress_ip_raw=$( (cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -raw nginx_ingress_ip) 2>"$tf_err_file" || true)
+  ingress_ip_err=$(cat "$tf_err_file")
+  local ingress_ip="$ingress_ip_raw"
+
+  rm -f "$tf_err_file"
 
   local name_servers
   name_servers=$(cd "${GCP_DEPLOY_DIR}/examples/self-deploy/root" && GOOGLE_APPLICATION_CREDENTIALS="$deployer_key" terraform output -json name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
@@ -972,6 +984,14 @@ deploy_gcp_run() {
   if [ -z "$portal_url_raw" ] && [ -z "$ingress_ip" ]; then
     echo ""
     warn "Terraform wasn't applied — nothing was deployed this run."
+    if [ -n "$portal_url_err" ]; then
+      error "portal_url lookup failed:"
+      echo "$portal_url_err" >&2
+    fi
+    if [ -n "$ingress_ip_err" ]; then
+      error "nginx_ingress_ip lookup failed:"
+      echo "$ingress_ip_err" >&2
+    fi
     info "Re-run install.sh and choose retry for env '${gcp_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
     return
   fi
