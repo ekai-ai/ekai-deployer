@@ -260,11 +260,11 @@ PYEOF
   fi
 
   info "Waiting for token from portal (listening on port ${CALLBACK_PORT})…" >/dev/tty
-  echo "  (If the browser doesn't open, visit the URL above, then copy your" >/dev/tty
-  echo "   EKAI_DEPLOY_TOKEN from the portal and paste it when prompted.)" >/dev/tty
+  echo "  If the browser doesn't open, visit the URL above to log in — the" >/dev/tty
+  echo "  page will send the token here automatically once you do." >/dev/tty
   echo "" >/dev/tty
 
-  # Give it 3 minutes to receive the token
+  # Give it 3 minutes to receive the token.
   local exchange_token=""
   local deadline=$(( $(date +%s) + 180 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -279,12 +279,8 @@ PYEOF
   trap - EXIT INT TERM
 
   if [ -z "$exchange_token" ]; then
-    warn "Did not receive token automatically." >/dev/tty
-    printf "Paste your exchange token from the portal here: " >/dev/tty
-    read -r exchange_token </dev/tty
+    die "Did not receive a token from the portal within 3 minutes. Make sure you logged in at the URL above, then re-run the installer."
   fi
-
-  [ -n "$exchange_token" ] || die "No token provided. Cannot continue."
 
   # Redeem the exchange token for the deploy token + email
   info "Redeeming token…" >/dev/tty
