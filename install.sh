@@ -932,7 +932,16 @@ deploy_gcp_run() {
   echo "  - enable required GCP APIs"
   echo "  - create a scoped deployer service account"
   echo "  - run 2 terraform applies (creates real, billable GCP resources)"
-  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$gcp_env" )
+  # self-deploy.sh's own prompts (the "Run the Terraform deploy now?"
+  # confirmation, password prompts) use plain `read`, not `read </dev/tty`
+  # -- it was only ever meant to run directly in a terminal. Under
+  # `curl install.sh | bash`, this script's own stdin is that same pipe,
+  # which is exhausted by the time we get here; without this redirect
+  # self-deploy.sh's first `read` hits EOF, returns non-zero, and set -e
+  # kills it silently right there -- confirmed live, not just reasoned
+  # about (ekai-deployer was the first thing to ever invoke self-deploy.sh
+  # this way instead of a human running it directly).
+  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$gcp_env" ) < /dev/tty
 
   # Read back from Terraform state rather than reconstructing the URL
   # ourselves — this is exactly what got deployed (works the same whether
@@ -1294,7 +1303,16 @@ deploy_aws_run() {
   info "This runs terraform-aws-ekai/scripts/self-deploy.sh, which will:"
   echo "  - create a scoped IAM deployer user (see PERMISSIONS.md)"
   echo "  - run 2 terraform applies (creates real, billable AWS resources)"
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" )
+  # self-deploy.sh's own prompts (the "Run the Terraform deploy now?"
+  # confirmation, password prompts) use plain `read`, not `read </dev/tty`
+  # -- it was only ever meant to run directly in a terminal. Under
+  # `curl install.sh | bash`, this script's own stdin is that same pipe,
+  # which is exhausted by the time we get here; without this redirect
+  # self-deploy.sh's first `read` hits EOF, returns non-zero, and set -e
+  # kills it silently right there -- confirmed live, not just reasoned
+  # about (this exact command, unmodified, is what a real curl | bash run
+  # died on).
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" ) < /dev/tty
 
   # --skip-dns-wait exits 0 in two different cases, and they need different
   # handling here: (a) it just created a brand-new Route53 zone and is
