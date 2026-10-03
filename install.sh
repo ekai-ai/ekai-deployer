@@ -15,6 +15,8 @@ ENV_FILE=".env"
 COMPOSE_FILE="docker-compose.yml"
 GCP_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-google-ekai/archive/refs/heads/main.tar.gz"
 GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
+AWS_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-aws-ekai/archive/refs/heads/main.tar.gz"
+AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -1034,6 +1036,317 @@ deploy_gcp_run() {
   echo ""
 }
 
+# ── AWS deployment ────────────────────────────────────────────────────────────
+# Checks every tool terraform-aws-ekai's self-deploy.sh needs (terraform,
+# kubectl, jq, dig — no gcloud/gke-gcloud-auth-plugin equivalent: EKS auth
+# goes through the aws CLI directly), offers to auto-install whatever's
+# missing (install_cmd_for already has entries for all of these, shared with
+# the GCP path), and reports anything still missing — all before asking any
+# of deploy_aws's region/env/dns_zone questions.
+check_aws_tools() {
+  reset_missing_tools
+  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
+  # self-deploy.sh's cicd apply needs kubectl to auth against the EKS
+  # cluster it just created, same reason as the GCP path.
+  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
+  # self-deploy.sh itself needs jq to parse aws CLI JSON output.
+  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
+  # self-deploy.sh polls DNS (via dig) to confirm the domain's name servers
+  # have propagated before continuing.
+  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
+
+  offer_auto_install_missing_tools
+}
+
+check_aws_prereqs() {
+  check_aws_tools
+  [ -z "$_missing_tools" ]
+}
+
+# Confirms the identity `aws configure` (or SSO, or a named profile) has
+# active right now can actually bootstrap a deployment -- self-deploy.sh
+# creates one IAM user + two IAM policies under THIS identity before
+# Terraform ever runs (see terraform-aws-ekai/PERMISSIONS.md — "the
+# bootstrapping identity"). Uses iam:SimulatePrincipalPolicy against the
+# caller's own ARN rather than checking attached role names — that only sees
+# direct bindings, this reports the real effective permission regardless of
+# whether it came from a direct policy, a group, or an org-level grant. Same
+# tool (and same reasoning) used to actually diagnose this project's own
+# real permission gaps earlier, not a new approach invented just for this
+# check.
+check_aws_permissions() {
+  local caller_arn
+  caller_arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)
+  [ -n "$caller_arn" ] || die "Could not determine the current AWS identity. Run: aws configure"
+
+  local response
+  response=$(aws iam simulate-principal-policy \
+    --policy-source-arn "$caller_arn" \
+    --action-names \
+      iam:GetUser iam:CreateUser iam:DeleteUser \
+      iam:AttachUserPolicy iam:DetachUserPolicy \
+      iam:ListAccessKeys iam:CreateAccessKey iam:DeleteAccessKey iam:UpdateAccessKey \
+      iam:GetPolicy iam:GetPolicyVersion iam:ListPolicyVersions \
+      iam:CreatePolicy iam:CreatePolicyVersion iam:DeletePolicyVersion \
+    --output json 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Could not run the IAM permission check for ${caller_arn}:"
+    echo "$response" >&2
+    die "Check AWS credentials are valid (aws sts get-caller-identity) and re-run."
+  fi
+
+  local missing
+  missing=$(echo "$response" | jq -r '.EvaluationResults[] | select(.EvalDecision != "allowed") | .EvalActionName')
+
+  if [ -n "$missing" ]; then
+    error "${caller_arn} is missing required IAM permissions to bootstrap a deployment:"
+    echo "$missing" | sed 's/^/  /' >&2
+    die "See https://github.com/ekai-ai/terraform-aws-ekai/blob/main/PERMISSIONS.md (\"bootstrapping identity\") for the exact policy to grant, then re-run."
+  fi
+  success "AWS permissions verified for ${caller_arn}"
+}
+
+# Mirrors detect_gcp_partial_deploy's intent exactly, adapted to this repo's
+# file names (a generated secrets file instead of a deployer-key JSON, and a
+# single backend-<env>.tfbackend instead of GCP's naming) — see that
+# function's own comment for why this deliberately doesn't try to guess
+# whether the previous run succeeded, failed, or is mid-DNS-wait.
+detect_aws_partial_deploy() {
+  [ -d "$AWS_DEPLOY_DIR" ] || return 0
+  local tfvars_dir="${AWS_DEPLOY_DIR}/env"
+  [ -d "$tfvars_dir" ] || return 0
+
+  local candidate
+  candidate=$(ls -t "${tfvars_dir}"/*.tfvars 2>/dev/null | grep -v '/customer\.tfvars$' | head -1 || true)
+  [ -n "$candidate" ] || return 0
+
+  local env_name
+  env_name=$(basename "$candidate" .tfvars)
+
+  local secrets_file="${AWS_DEPLOY_DIR}/.self-deploy/${env_name}-generated-secrets.txt"
+  local backend_file="${tfvars_dir}/backend-${env_name}.tfbackend"
+
+  [ -f "$secrets_file" ] || [ -f "$backend_file" ] || return 0
+
+  echo "$env_name"
+}
+
+deploy_aws() {
+  local token="$1"
+
+  echo "" >/dev/tty
+  info "Checking AWS credentials/permissions…" >/dev/tty
+  check_aws_permissions
+
+  printf "AWS region [us-east-1]: " >/dev/tty
+  local aws_region
+  read -r aws_region </dev/tty
+  aws_region="${aws_region:-us-east-1}"
+
+  echo "" >/dev/tty
+  warn "The environment name becomes part of every AWS resource this creates (the EKS cluster, the IAM deployer user, the S3 state bucket, ...) — it must be unique per deployment." >/dev/tty
+  local aws_env=""
+  while [ -z "$aws_env" ]; do
+    printf "Environment name: " >/dev/tty
+    read -r aws_env </dev/tty
+    if [ -z "$aws_env" ]; then
+      printf "Environment name is required: " >/dev/tty
+    elif [ "$aws_env" = "customer" ]; then
+      warn "\"customer\" is reserved (it's the template file itself) — pick a different environment name." >/dev/tty
+      aws_env=""
+    fi
+  done
+
+  echo "" >/dev/tty
+  info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates a Route53 zone under it, which you'll delegate to AWS's nameservers at your registrar afterward." >/dev/tty
+  local aws_dns_zone=""
+  printf "DNS zone (e.g. example.com): " >/dev/tty
+  while [ -z "$aws_dns_zone" ]; do
+    read -r aws_dns_zone </dev/tty
+    [ -n "$aws_dns_zone" ] || printf "DNS zone (required): " >/dev/tty
+  done
+
+  echo "" >/dev/tty
+  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
+  info "This is a separate, optional choice about which service delivers app emails — unrelated to which cloud hosts the deployment. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
+  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
+  local use_own_email
+  read -r use_own_email </dev/tty
+  local email_provider="licensing"
+  local sendgrid_api_key="" sendgrid_from_email=""
+  local ses_aws_region="" aws_ses_access_key_id="" aws_ses_secret_access_key="" aws_ses_from_email=""
+  case "$use_own_email" in
+    y|Y|yes|Yes)
+      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
+      printf "Which provider? [1/2]: " >/dev/tty
+      local email_choice
+      read -r email_choice </dev/tty
+      case "$email_choice" in
+        1|sendgrid|SendGrid)
+          email_provider="sendgrid"
+          printf "SendGrid API key: " >/dev/tty
+          while [ -z "$sendgrid_api_key" ]; do
+            read -r sendgrid_api_key </dev/tty
+            [ -n "$sendgrid_api_key" ] || printf "SendGrid API key (required): " >/dev/tty
+          done
+          printf "SendGrid from-email: " >/dev/tty
+          while [ -z "$sendgrid_from_email" ]; do
+            read -r sendgrid_from_email </dev/tty
+            [ -n "$sendgrid_from_email" ] || printf "SendGrid from-email (required): " >/dev/tty
+          done
+          ;;
+        2|ses|SES)
+          email_provider="ses"
+          printf "AWS SES region [us-east-1]: " >/dev/tty
+          read -r ses_aws_region </dev/tty
+          ses_aws_region="${ses_aws_region:-us-east-1}"
+          printf "AWS access key ID: " >/dev/tty
+          while [ -z "$aws_ses_access_key_id" ]; do
+            read -r aws_ses_access_key_id </dev/tty
+            [ -n "$aws_ses_access_key_id" ] || printf "AWS access key ID (required): " >/dev/tty
+          done
+          printf "AWS secret access key: " >/dev/tty
+          while [ -z "$aws_ses_secret_access_key" ]; do
+            read -r aws_ses_secret_access_key </dev/tty
+            [ -n "$aws_ses_secret_access_key" ] || printf "AWS secret access key (required): " >/dev/tty
+          done
+          printf "SES from-email: " >/dev/tty
+          while [ -z "$aws_ses_from_email" ]; do
+            read -r aws_ses_from_email </dev/tty
+            [ -n "$aws_ses_from_email" ] || printf "SES from-email (required): " >/dev/tty
+          done
+          ;;
+        *) die "Invalid choice: $email_choice" ;;
+      esac
+      ;;
+    *) : ;;
+  esac
+
+  if [ -d "$AWS_DEPLOY_DIR" ]; then
+    warn "${AWS_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
+  else
+    info "Downloading terraform-aws-ekai…"
+    local tarball
+    tarball=$(mktemp)
+    curl -fsSL "$AWS_REPO_TARBALL_URL" -o "$tarball"
+    mkdir -p "$AWS_DEPLOY_DIR"
+    tar -xzf "$tarball" --strip-components=1 -C "$AWS_DEPLOY_DIR"
+    rm -f "$tarball"
+    success "Downloaded terraform-aws-ekai"
+  fi
+
+  local tfvars_dir="${AWS_DEPLOY_DIR}/env"
+  local tfvars_file="${tfvars_dir}/${aws_env}.tfvars"
+
+  if [ -f "$tfvars_file" ]; then
+    warn "${tfvars_file} already exists."
+    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
+    local overwrite
+    read -r overwrite </dev/tty
+    case "$overwrite" in
+      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_aws_run "$aws_env" "$aws_dns_zone"; return ;;
+      *) ;;
+    esac
+  fi
+
+  # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
+  # sed doesn't support it; it silently no-ops instead of erroring, which
+  # would leave every "customer" placeholder in place with no warning).
+  sed \
+    -e "s/^region = \"us-east-1\"/region = \"${aws_region}\"/" \
+    -e "s/^env = \"customer\"/env = \"${aws_env}\"/" \
+    -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${aws_dns_zone}\"/" \
+    "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
+
+  {
+    echo ""
+    echo "# Added by install.sh — deploy token + licensing portal, same values"
+    echo "# written to .env for the local Docker path."
+    echo "secret_value_overrides = {"
+    echo "  EKAI_DEPLOY_TOKEN         = \"${token}\""
+    echo "  EKAI_LICENSING_PORTAL_URL = \"${PORTAL_URL}\""
+    echo "  EMAIL_PROVIDER            = \"${email_provider}\""
+    case "$email_provider" in
+      sendgrid)
+        echo "  SENDGRID_API_KEY          = \"${sendgrid_api_key}\""
+        echo "  SENDGRID_FROM_EMAIL       = \"${sendgrid_from_email}\""
+        ;;
+      ses)
+        echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${aws_ses_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_ses_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        ;;
+    esac
+    echo "}"
+  } >> "$tfvars_file"
+  success "${tfvars_file} written"
+
+  deploy_aws_run "$aws_env" "$aws_dns_zone"
+}
+
+deploy_aws_run() {
+  local aws_env="$1"
+  local aws_dns_zone="$2"
+
+  echo ""
+  info "Ready to deploy to AWS (env=${aws_env})."
+  info "This runs terraform-aws-ekai/scripts/self-deploy.sh, which will:"
+  echo "  - create a scoped IAM deployer user (see PERMISSIONS.md)"
+  echo "  - run 2 terraform applies (creates real, billable AWS resources)"
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" )
+
+  # --skip-dns-wait exits 0 in two different cases, and they need different
+  # handling here: (a) it just created a brand-new Route53 zone and is
+  # deliberately NOT proceeding to the cicd apply until delegation is in
+  # place (see that flag's own comment in self-deploy.sh for why — AWS's
+  # certificate validation blocks synchronously, unlike GCP's async
+  # cert-manager reconciliation, so falling through here would just hang),
+  # or (b) the full deploy — both applies — actually completed (an existing
+  # zone was used, so there was never anything to wait for). portal_url only
+  # exists in examples/self-deploy/cicd's OWN state, which is only written
+  # once that second apply has actually run — check there specifically
+  # rather than trusting the exit code alone, same reasoning as
+  # deploy_gcp_run's own portal_url_raw check below.
+  local tf_err_file
+  tf_err_file=$(mktemp)
+
+  local portal_url_raw portal_url_err
+  portal_url_raw=$( (cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
+  portal_url_err=$(cat "$tf_err_file")
+  rm -f "$tf_err_file"
+
+  if [ -z "$portal_url_raw" ]; then
+    echo ""
+    warn "Deploy is paused, waiting on DNS delegation (see the nameservers printed above)."
+    info "Once that NS record is added and has propagated, continue with:"
+    echo "    cd ${AWS_DEPLOY_DIR} && ./scripts/self-deploy.sh ${aws_env}"
+    info "(no --skip-dns-wait this time — that resumes normally, into the full apply, and the"
+    info "Route53 zone from this run already exists, so it won't try to recreate it.)"
+    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
+      error "(unexpected error reading cicd state, for reference:)"
+      echo "$portal_url_err" >&2
+    fi
+    return
+  fi
+
+  echo ""
+  success "Ekai is running!"
+  echo ""
+  echo "  ${bold}Ekai:${reset}   ${portal_url_raw}"
+
+  local argocd_url
+  argocd_url=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -raw argocd_url 2>/dev/null || true)
+  if [ -n "$argocd_url" ]; then
+    echo ""
+    echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
+    echo "  (user: admin, password:"
+    echo "    cd ${AWS_DEPLOY_DIR}/examples/self-deploy/root"
+    echo "    terraform output -raw argocd_admin_password_plaintext)"
+  fi
+  echo ""
+}
+
 deploy_cloud() {
   local token="$1"
   local provider="$2"
@@ -1102,6 +1415,36 @@ main() {
     esac
   fi
 
+  # Same check for a previous AWS run — see detect_aws_partial_deploy's own
+  # comment for why this is a separate check from the GCP one above rather
+  # than a shared one keyed on provider: the two deploy dirs, tfvars
+  # templates, and resume artifacts are all different.
+  local partial_aws_env
+  partial_aws_env=$(detect_aws_partial_deploy)
+  if [ -n "$partial_aws_env" ]; then
+    echo "" >/dev/tty
+    warn "Found previous run artifacts for AWS env '${partial_aws_env}'." >/dev/tty
+    printf "Retry that deploy instead of starting a new one? [y/N] " >/dev/tty
+    local aws_resume_choice
+    read -r aws_resume_choice </dev/tty
+    case "$aws_resume_choice" in
+      y|Y|yes|Yes)
+        if check_aws_prereqs; then
+          local tfvars_dir="${AWS_DEPLOY_DIR}/env"
+          local tfvars_file="${tfvars_dir}/${partial_aws_env}.tfvars"
+          local resume_dns_zone
+          resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+          deploy_aws_run "$partial_aws_env" "$resume_dns_zone"
+          return
+        else
+          echo ""
+          die "One or more AWS prerequisites are missing. Fix the issues above and re-run."
+        fi
+        ;;
+      *) info "Starting a new deployment." ;;
+    esac
+  fi
+
   # Get deploy token + user email via browser login
   local token_output
   token_output=$(get_token_via_browser)
@@ -1132,6 +1475,13 @@ main() {
       else
         echo ""
         die "One or more GCP prerequisites are missing. Fix the issues above and re-run."
+      fi
+    elif [ "$provider" = "aws" ]; then
+      if check_cloud_cli "$provider" && check_aws_prereqs; then
+        deploy_aws "$token"
+      else
+        echo ""
+        die "One or more AWS prerequisites are missing. Fix the issues above and re-run."
       fi
     else
       if check_cloud_cli "$provider"; then
