@@ -1318,15 +1318,17 @@ deploy_aws_run() {
   info "This runs terraform-aws-ekai/scripts/self-deploy.sh, which will:"
   echo "  - create a scoped IAM deployer user (see PERMISSIONS.md)"
   echo "  - run 2 terraform applies (creates real, billable AWS resources)"
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" )
+  # No --skip-dns-wait here -- self-deploy.sh runs its normal, full
+  # interactive flow (waits for Enter, polls for DNS propagation, then both
+  # applies) in this one call, exactly like a direct run would. Only
+  # install.sh's own invocation changed; the flag itself is untouched in
+  # self-deploy.sh for anyone who still wants it directly.
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" )
 
-  # Mirrors deploy_gcp_run's own portal_url check exactly. self-deploy.sh's
-  # --skip-dns-wait here means the same thing it does for GCP as far as this
-  # check is concerned: if it hasn't reached the cicd apply yet, portal_url
-  # won't exist. No separate AWS-specific "paused" messaging needed -- the
-  # existing "nothing was deployed this run, re-run and retry" wording below
-  # is accurate either way (declined the confirmation, or still waiting on
-  # DNS propagation).
+  # Mirrors deploy_gcp_run's own portal_url check exactly. A non-empty
+  # portal_url is the signal the cicd apply actually completed; empty means
+  # nothing was deployed this run (declined the confirmation, or a failure
+  # before cicd ever ran).
   local tf_err_file
   tf_err_file=$(mktemp)
 
