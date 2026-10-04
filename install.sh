@@ -1318,23 +1318,43 @@ deploy_aws_run() {
   info "This runs terraform-aws-ekai/scripts/self-deploy.sh, which will:"
   echo "  - create a scoped IAM deployer user (see PERMISSIONS.md)"
   echo "  - run 2 terraform applies (creates real, billable AWS resources)"
-  # No --skip-dns-wait: self-deploy.sh handles DNS delegation itself (prints
-  # the nameservers, waits for Enter, polls for propagation) inline.
-  #
-  # Run inside `script`, not called directly: unlike GCP's single plain
-  # `terraform apply`, this repo's self-deploy.sh does an EARLIER, separate
-  # targeted apply just for the Route53 zone before reaching the delegation
-  # prompt -- and confirmed live, every line of self-deploy.sh's own output
-  # from that point on (plain echo included, not just Terraform's) silently
-  # never reached the terminal, even though the process ran correctly and
-  # the prompt itself still appeared. `script` gives this whole subprocess
-  # tree a genuine fresh pty, which fixes that regardless of the exact
-  # reason a plain nested invocation lost it. GCP's call is left exactly as
-  # it was -- it doesn't have this problem, so it doesn't need this either.
-  script -qec "cd '${AWS_DEPLOY_DIR}' && ./scripts/self-deploy.sh '${aws_env}'" /dev/null
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" )
 
-  local portal_url_raw
-  portal_url_raw=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url 2>/dev/null || true)
+  # Mirrors deploy_gcp_run's own portal_url check exactly. self-deploy.sh's
+  # --skip-dns-wait here means the same thing it does for GCP as far as this
+  # check is concerned: if it hasn't reached the cicd apply yet, portal_url
+  # won't exist. No separate AWS-specific "paused" messaging needed -- the
+  # existing "nothing was deployed this run, re-run and retry" wording below
+  # is accurate either way (declined the confirmation, or still waiting on
+  # DNS propagation).
+  local tf_err_file
+  tf_err_file=$(mktemp)
+
+  local portal_url_raw portal_url_err
+  portal_url_raw=$( (cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
+  portal_url_err=$(cat "$tf_err_file")
+  rm -f "$tf_err_file"
+
+  local name_servers
+  name_servers=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -json route53_name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
+
+  if [ -z "$portal_url_raw" ]; then
+    echo ""
+    warn "Terraform wasn't fully applied — nothing was deployed this run."
+    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
+      error "portal_url lookup failed:"
+      echo "$portal_url_err" >&2
+    fi
+    if [ -n "$name_servers" ]; then
+      echo ""
+      echo "  ${bold}Before ${aws_dns_zone} works:${reset} delegate it to these nameservers at your domain"
+      echo "  registrar (or parent DNS zone) — add an NS record for ${aws_dns_zone} pointing at each:"
+      echo "$name_servers" | sed 's/^/    /'
+      echo "  DNS propagation can take anywhere from a few minutes to a few hours."
+    fi
+    info "Re-run install.sh and choose retry for env '${aws_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
+    return
+  fi
 
   echo ""
   success "Ekai is running!"
