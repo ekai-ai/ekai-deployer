@@ -18,6 +18,30 @@ GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
 AWS_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-aws-ekai/archive/refs/heads/main.tar.gz"
 AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 
+# When run via `curl ... | bash`, this script's own stdin is a pipe, not a
+# real terminal -- and with the whole process tree rooted that way, deeply
+# nested children (self-deploy.sh's own terraform calls, two levels down in
+# the cloud deploy paths) can lose proper foreground-terminal association
+# and silently suppress their live progress output, even though fd 1
+# nominally still points at the terminal (confirmed live: a targeted apply
+# ran and completed correctly with zero output reaching the terminal).
+# Re-exec from a freshly-downloaded real file instead of continuing to run
+# from the pipe -- a real file as $0 restores normal job-control/foreground
+# behavior for everything this script goes on to run. Re-downloads rather
+# than trying to recover the remainder of the current pipe, since bash may
+# have already buffered an unknown amount of this script's own source out
+# of it by this point.
+if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
+  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX.sh)
+  if curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
+    chmod +x "$SELF_COPY"
+    EKAI_INSTALL_REEXEC=1 exec bash "$SELF_COPY" "$@" < /dev/tty
+  else
+    echo "Warning: could not re-download install.sh for a clean re-exec; continuing from the pipe as-is (live progress output may be suppressed for nested Terraform runs)." >&2
+    rm -f "$SELF_COPY"
+  fi
+fi
+
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 bold=$(tput bold 2>/dev/null || true)
@@ -932,16 +956,7 @@ deploy_gcp_run() {
   echo "  - enable required GCP APIs"
   echo "  - create a scoped deployer service account"
   echo "  - run 2 terraform applies (creates real, billable GCP resources)"
-  # self-deploy.sh's own prompts (the "Run the Terraform deploy now?"
-  # confirmation, password prompts) use plain `read`, not `read </dev/tty`
-  # -- it was only ever meant to run directly in a terminal. Under
-  # `curl install.sh | bash`, this script's own stdin is that same pipe,
-  # which is exhausted by the time we get here; without this redirect
-  # self-deploy.sh's first `read` hits EOF, returns non-zero, and set -e
-  # kills it silently right there -- confirmed live, not just reasoned
-  # about (ekai-deployer was the first thing to ever invoke self-deploy.sh
-  # this way instead of a human running it directly).
-  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$gcp_env" ) < /dev/tty
+  ( cd "$GCP_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$gcp_env" )
 
   # Read back from Terraform state rather than reconstructing the URL
   # ourselves — this is exactly what got deployed (works the same whether
@@ -1312,41 +1327,15 @@ deploy_aws_run() {
   # kills it silently right there -- confirmed live, not just reasoned
   # about (this exact command, unmodified, is what a real curl | bash run
   # died on).
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$aws_env" ) < /dev/tty
+  # No --skip-dns-wait: self-deploy.sh handles DNS delegation itself (prints
+  # the nameservers, waits for Enter, polls for propagation) inline, in this
+  # same call -- now that the re-exec above guarantees a real terminal all
+  # the way down, there's no need for the separate "exit here, come back
+  # once delegation is done" dance that flag existed for.
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" ) < /dev/tty
 
-  # --skip-dns-wait exits 0 in two different cases, and they need different
-  # handling here: (a) it just created a brand-new Route53 zone and is
-  # deliberately NOT proceeding to the cicd apply until delegation is in
-  # place (see that flag's own comment in self-deploy.sh for why — AWS's
-  # certificate validation blocks synchronously, unlike GCP's async
-  # cert-manager reconciliation, so falling through here would just hang),
-  # or (b) the full deploy — both applies — actually completed (an existing
-  # zone was used, so there was never anything to wait for). portal_url only
-  # exists in examples/self-deploy/cicd's OWN state, which is only written
-  # once that second apply has actually run — check there specifically
-  # rather than trusting the exit code alone, same reasoning as
-  # deploy_gcp_run's own portal_url_raw check below.
-  local tf_err_file
-  tf_err_file=$(mktemp)
-
-  local portal_url_raw portal_url_err
-  portal_url_raw=$( (cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
-  portal_url_err=$(cat "$tf_err_file")
-  rm -f "$tf_err_file"
-
-  if [ -z "$portal_url_raw" ]; then
-    echo ""
-    warn "Deploy is paused, waiting on DNS delegation (see the nameservers printed above)."
-    info "Once that NS record is added and has propagated, continue with:"
-    echo "    cd ${AWS_DEPLOY_DIR} && ./scripts/self-deploy.sh ${aws_env}"
-    info "(no --skip-dns-wait this time — that resumes normally, into the full apply, and the"
-    info "Route53 zone from this run already exists, so it won't try to recreate it.)"
-    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
-      error "(unexpected error reading cicd state, for reference:)"
-      echo "$portal_url_err" >&2
-    fi
-    return
-  fi
+  local portal_url_raw
+  portal_url_raw=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url 2>/dev/null || true)
 
   echo ""
   success "Ekai is running!"
