@@ -1318,24 +1318,20 @@ deploy_aws_run() {
   info "This runs terraform-aws-ekai/scripts/self-deploy.sh, which will:"
   echo "  - create a scoped IAM deployer user (see PERMISSIONS.md)"
   echo "  - run 2 terraform applies (creates real, billable AWS resources)"
-  # self-deploy.sh's own prompts (the "Run the Terraform deploy now?"
-  # confirmation, password prompts) use plain `read`, not `read </dev/tty`
-  # -- it was only ever meant to run directly in a terminal. Under
-  # `curl install.sh | bash`, this script's own stdin is that same pipe,
-  # which is exhausted by the time we get here; without this redirect
-  # self-deploy.sh's first `read` hits EOF, returns non-zero, and set -e
-  # kills it silently right there -- confirmed live, not just reasoned
-  # about (this exact command, unmodified, is what a real curl | bash run
-  # died on).
   # No --skip-dns-wait: self-deploy.sh handles DNS delegation itself (prints
-  # the nameservers, waits for Enter, polls for propagation) inline, in this
-  # same call -- now that the re-exec above guarantees a real terminal all
-  # the way down, there's no need for the separate "exit here, come back
-  # once delegation is done" dance that flag existed for. Plain inheritance,
-  # no explicit < /dev/tty here -- matches the GCP call exactly, which is
-  # confirmed working correctly; an extra explicit stdin redirect on top of
-  # the already-fixed re-exec was interfering with stdout visibility here.
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" )
+  # the nameservers, waits for Enter, polls for propagation) inline.
+  #
+  # Run inside `script`, not called directly: unlike GCP's single plain
+  # `terraform apply`, this repo's self-deploy.sh does an EARLIER, separate
+  # targeted apply just for the Route53 zone before reaching the delegation
+  # prompt -- and confirmed live, every line of self-deploy.sh's own output
+  # from that point on (plain echo included, not just Terraform's) silently
+  # never reached the terminal, even though the process ran correctly and
+  # the prompt itself still appeared. `script` gives this whole subprocess
+  # tree a genuine fresh pty, which fixes that regardless of the exact
+  # reason a plain nested invocation lost it. GCP's call is left exactly as
+  # it was -- it doesn't have this problem, so it doesn't need this either.
+  script -qec "cd '${AWS_DEPLOY_DIR}' && ./scripts/self-deploy.sh '${aws_env}'" /dev/null
 
   local portal_url_raw
   portal_url_raw=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url 2>/dev/null || true)
