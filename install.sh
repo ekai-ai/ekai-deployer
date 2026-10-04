@@ -1323,7 +1323,15 @@ deploy_aws_run() {
   # applies) in this one call, exactly like a direct run would. Only
   # install.sh's own invocation changed; the flag itself is untouched in
   # self-deploy.sh for anyone who still wants it directly.
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" )
+  #
+  # >/dev/tty: self-deploy.sh has no tty redirects of its own (it's meant to
+  # also be run directly, where plain stdout is correct). Nested this deep
+  # under the curl|bash re-exec, plain stdout doesn't reliably reach the
+  # screen even though fd 1 nominally still points at the terminal -- same
+  # class of issue the re-exec above exists for. Forcing it onto /dev/tty
+  # here, at the call site, fixes it for this invocation without changing
+  # self-deploy.sh's own behavior for anyone running it directly.
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" ) >/dev/tty
 
   # Mirrors deploy_gcp_run's own portal_url check exactly. A non-empty
   # portal_url is the signal the cicd apply actually completed; empty means
