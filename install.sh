@@ -1331,8 +1331,11 @@ deploy_aws_run() {
   # the nameservers, waits for Enter, polls for propagation) inline, in this
   # same call -- now that the re-exec above guarantees a real terminal all
   # the way down, there's no need for the separate "exit here, come back
-  # once delegation is done" dance that flag existed for.
-  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" ) < /dev/tty
+  # once delegation is done" dance that flag existed for. Plain inheritance,
+  # no explicit < /dev/tty here -- matches the GCP call exactly, which is
+  # confirmed working correctly; an extra explicit stdin redirect on top of
+  # the already-fixed re-exec was interfering with stdout visibility here.
+  ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" )
 
   local portal_url_raw
   portal_url_raw=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url 2>/dev/null || true)
