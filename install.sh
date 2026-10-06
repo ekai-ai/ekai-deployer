@@ -6,9 +6,17 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
-PORTAL_URL="https://dev.licensing.ekai.ai"  # production default — uncomment for prod
+# Only line to touch when merging dev -> staging -> main — everything below
+# derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
+# each other the way they did before.
+DEPLOYER_BRANCH="staging"  # dev | staging | main
+if [ "$DEPLOYER_BRANCH" = "main" ]; then
+  PORTAL_URL="https://licensing.ekai.ai"
+else
+  PORTAL_URL="https://${DEPLOYER_BRANCH}.licensing.ekai.ai"
+fi
 CALLBACK_PORT="${EKAI_CALLBACK_PORT:-9999}"
-BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/dev"
+BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/${DEPLOYER_BRANCH}"
 COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
@@ -477,32 +485,34 @@ deploy_local() {
     success "Database is ready"
 
     info "Seeding user account (${user_email})…"
-    docker exec -i ekai-postgres psql -U ekai -d ekaibackend -v ON_ERROR_STOP=1 -q <<SQL
+    # -v email=... + :'email' lets psql quote the value itself, instead of us
+    # dropping it into the SQL as a literal string.
+    docker exec -i ekai-postgres psql -U ekai -d ekaibackend -v ON_ERROR_STOP=1 -v email="${user_email}" -q <<'SQL'
 INSERT INTO "Users" (id, email, name, status, "roleId", "createdAt")
-VALUES (gen_random_uuid(), '${user_email}', '${user_email}', 'active', 4, now())
+VALUES (gen_random_uuid(), :'email', :'email', 'active', 4, now())
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO "UserCredentials" ("userId", password, "createdAt", "updatedAt")
-SELECT id, NULL, now(), now() FROM "Users" WHERE email = '${user_email}'
+SELECT id, NULL, now(), now() FROM "Users" WHERE email = :'email'
 ON CONFLICT ("userId") DO NOTHING;
 
 INSERT INTO "Tenants" (name, "subscriptionId", "createdById")
 SELECT 'My Tenant', s.id, u.id
 FROM "Subscription" s, "Users" u
-WHERE s.name = 'Trial' AND u.email = '${user_email}'
+WHERE s.name = 'Trial' AND u.email = :'email'
   AND NOT EXISTS (SELECT 1 FROM "Tenants" LIMIT 1);
 
 INSERT INTO "TenantUsers" ("tenantId", "userId")
 SELECT t.id, u.id
 FROM "Tenants" t, "Users" u
-WHERE u.email = '${user_email}'
+WHERE u.email = :'email'
 ORDER BY t.id
 LIMIT 1
 ON CONFLICT DO NOTHING;
 SQL
     local seeded_email
     seeded_email=$(docker exec ekai-postgres psql -U ekai -d ekaibackend -tAq \
-      -c "SELECT email FROM \"Users\" WHERE email = '${user_email}' LIMIT 1;" 2>/dev/null || true)
+      -v email="${user_email}" -c "SELECT email FROM \"Users\" WHERE email = :'email' LIMIT 1;" 2>/dev/null || true)
     if [ "$seeded_email" = "$user_email" ]; then
       success "Account ready for ${user_email}"
     else
@@ -1103,9 +1113,22 @@ check_aws_permissions() {
   caller_arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)
   [ -n "$caller_arn" ] || die "Could not determine the current AWS identity. Run: aws configure"
 
+  # simulate-principal-policy rejects an assumed-role ARN outright (SSO
+  # logins and anything else that goes through AssumeRole all show up as
+  # one) -- it only takes a real user/group/role ARN. Swap in the
+  # underlying role for the simulate call; keep caller_arn as-is for the
+  # messages below, since that's the identity the person actually knows.
+  local policy_arn="$caller_arn"
+  if [[ "$caller_arn" == *:assumed-role/* ]]; then
+    local account role_name
+    account=$(echo "$caller_arn" | cut -d: -f5)
+    role_name=$(echo "$caller_arn" | cut -d/ -f2)
+    policy_arn="arn:aws:iam::${account}:role/${role_name}"
+  fi
+
   local response
   response=$(aws iam simulate-principal-policy \
-    --policy-source-arn "$caller_arn" \
+    --policy-source-arn "$policy_arn" \
     --action-names \
       iam:GetUser iam:CreateUser iam:DeleteUser \
       iam:AttachUserPolicy iam:DetachUserPolicy \
@@ -1178,6 +1201,9 @@ deploy_aws() {
     elif [ "$aws_env" = "customer" ]; then
       warn "\"customer\" is reserved (it's the template file itself) — pick a different environment name." >/dev/tty
       aws_env=""
+    elif [ ${#aws_env} -gt 20 ]; then
+      printf "Environment name must be 20 characters or fewer (got %d) — the S3 state bucket name is \"ekai-terraform-state-<env>-<region>\", capped at 63 chars total: " "${#aws_env}" >/dev/tty
+      aws_env=""
     fi
   done
 
@@ -1210,9 +1236,10 @@ deploy_aws() {
           email_provider="sendgrid"
           printf "SendGrid API key: " >/dev/tty
           while [ -z "$sendgrid_api_key" ]; do
-            read -r sendgrid_api_key </dev/tty
-            [ -n "$sendgrid_api_key" ] || printf "SendGrid API key (required): " >/dev/tty
+            read -rs sendgrid_api_key </dev/tty
+            [ -n "$sendgrid_api_key" ] || printf "\nSendGrid API key (required): " >/dev/tty
           done
+          echo "" >/dev/tty
           printf "SendGrid from-email: " >/dev/tty
           while [ -z "$sendgrid_from_email" ]; do
             read -r sendgrid_from_email </dev/tty
@@ -1231,9 +1258,10 @@ deploy_aws() {
           done
           printf "AWS secret access key: " >/dev/tty
           while [ -z "$aws_ses_secret_access_key" ]; do
-            read -r aws_ses_secret_access_key </dev/tty
-            [ -n "$aws_ses_secret_access_key" ] || printf "AWS secret access key (required): " >/dev/tty
+            read -rs aws_ses_secret_access_key </dev/tty
+            [ -n "$aws_ses_secret_access_key" ] || printf "\nAWS secret access key (required): " >/dev/tty
           done
+          echo "" >/dev/tty
           printf "SES from-email: " >/dev/tty
           while [ -z "$aws_ses_from_email" ]; do
             read -r aws_ses_from_email </dev/tty
@@ -1279,7 +1307,7 @@ deploy_aws() {
   sed \
     -e "s/^region = \"us-east-1\"/region = \"${aws_region}\"/" \
     -e "s/^env = \"customer\"/env = \"${aws_env}\"/" \
-    -e "s/^dns_zone        = \"customer.ekai.ai\".*/dns_zone        = \"${aws_dns_zone}\"/" \
+    -e "s/^dns_zone[[:space:]]*=[[:space:]]*\"customer.ekai.ai\".*/dns_zone        = \"${aws_dns_zone}\"/" \
     "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
 
   {
