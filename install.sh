@@ -205,6 +205,29 @@ offer_auto_install_missing_tools() {
 need curl "Install it with: brew install curl (macOS) or apt-get install curl / yum install curl (Linux)."
 fail_if_missing_tools
 
+# Prompts for "<prompt>: " and keeps re-asking "<prompt> (required): " until
+# something non-empty comes back, then writes it into the caller's variable.
+# Pass -s to read silently (for secrets) -- it still re-prompts the same
+# way, just without echoing input, and prints the newline -s itself
+# swallows once a value is accepted. Replaces the same ~10-line
+# while-read-or-reprompt block that used to be copy-pasted once per field
+# across deploy_gcp/deploy_aws.
+ask_required() {
+  local __var="$1" __prompt="$2" __silent="${3:-}" __value=""
+  printf "%s: " "$__prompt" >/dev/tty
+  while [ -z "$__value" ]; do
+    if [ "$__silent" = "-s" ]; then
+      read -rs __value </dev/tty
+      [ -n "$__value" ] || printf "\n%s (required): " "$__prompt" >/dev/tty
+    else
+      read -r __value </dev/tty
+      [ -n "$__value" ] || printf "%s (required): " "$__prompt" >/dev/tty
+    fi
+  done
+  [ "$__silent" = "-s" ] && echo "" >/dev/tty
+  printf -v "$__var" '%s' "$__value"
+}
+
 # ── Step 1: get deploy token via browser login ─────────────────────────────────
 get_token_via_browser() {
   local callback_url="http://localhost:${CALLBACK_PORT}/token"
@@ -741,18 +764,22 @@ check_gcp_permissions() {
   success "GCP permissions verified on ${project_id}"
 }
 
-# Looks for local signs that a GCP deploy was previously started for some env
-# (a generated tfvars + deployer key or backend config) — this catches a
-# self-deploy.sh run that errored, timed out, or was interrupted partway, as
-# well as a run that finished cleanly. Prints the candidate env name on
-# stdout if found, empty otherwise. Deliberately doesn't try to tell those
-# cases apart (e.g. by reading Terraform output) — the user already saw that
-# run's logs and knows whether it succeeded better than any local-file/state
-# heuristic could; this only surfaces that artifacts exist so they can choose
-# to retry or start fresh.
-detect_gcp_partial_deploy() {
-  [ -d "$GCP_DEPLOY_DIR" ] || return 0
-  local tfvars_dir="${GCP_DEPLOY_DIR}/env"
+# Looks for local signs that a deploy was previously started for some env (a
+# generated tfvars + an artifact that only shows up once self-deploy.sh is
+# partway through -- GCP's deployer-key JSON, AWS's generated-secrets file --
+# or a backend config). Catches a self-deploy.sh run that errored, timed out,
+# or was interrupted partway, as well as a run that finished cleanly. Prints
+# the candidate env name on stdout if found, empty otherwise. Deliberately
+# doesn't try to tell those cases apart (e.g. by reading Terraform output) —
+# the user already saw that run's logs and knows whether it succeeded better
+# than any local-file/state heuristic could; this only surfaces that
+# artifacts exist so they can choose to retry or start fresh.
+detect_partial_deploy() {
+  local deploy_dir="$1"
+  local artifact_suffix="$2"  # "-deployer-key.json" (GCP) or "-generated-secrets.txt" (AWS)
+
+  [ -d "$deploy_dir" ] || return 0
+  local tfvars_dir="${deploy_dir}/env"
   [ -d "$tfvars_dir" ] || return 0
 
   # Most-recently-modified non-template tfvars file is our one candidate —
@@ -765,16 +792,16 @@ detect_gcp_partial_deploy() {
   local env_name
   env_name=$(basename "$candidate" .tfvars)
 
-  local deployer_key="${GCP_DEPLOY_DIR}/.self-deploy/${env_name}-deployer-key.json"
+  local artifact_file="${deploy_dir}/.self-deploy/${env_name}${artifact_suffix}"
   local backend_file="${tfvars_dir}/backend-${env_name}.tfbackend"
 
-  # Deployer key or backend config existing means self-deploy.sh got at
-  # least as far as Step 2/3 — real signal something was attempted, not
-  # just a tfvars file the user hand-edited and never ran. Note the
-  # deployer key is meant to be deleted after copying it somewhere safe
-  # (self-deploy.sh says so at the end), so its absence alone doesn't mean
-  # anything — the backend file check covers that case.
-  [ -f "$deployer_key" ] || [ -f "$backend_file" ] || return 0
+  # Artifact or backend config existing means self-deploy.sh got at least as
+  # far as Step 2/3 — real signal something was attempted, not just a
+  # tfvars file the user hand-edited and never ran. Note GCP's deployer key
+  # is meant to be deleted after copying it somewhere safe (self-deploy.sh
+  # says so at the end), so its absence alone doesn't mean anything — the
+  # backend file check covers that case.
+  [ -f "$artifact_file" ] || [ -f "$backend_file" ] || return 0
 
   echo "$env_name"
 }
@@ -783,12 +810,8 @@ deploy_gcp() {
   local token="$1"
 
   echo "" >/dev/tty
-  printf "GCP project ID: " >/dev/tty
-  local gcp_project_id=""
-  while [ -z "$gcp_project_id" ]; do
-    read -r gcp_project_id </dev/tty
-    [ -n "$gcp_project_id" ] || printf "GCP project ID (required): " >/dev/tty
-  done
+  local gcp_project_id
+  ask_required gcp_project_id "GCP project ID"
 
   check_gcp_permissions "$gcp_project_id"
 
@@ -816,21 +839,13 @@ deploy_gcp() {
 
   echo "" >/dev/tty
   info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates a Cloud DNS zone under it, which you'll delegate to Google's nameservers at your registrar afterward." >/dev/tty
-  local gcp_dns_zone=""
-  printf "DNS zone (e.g. example.com): " >/dev/tty
-  while [ -z "$gcp_dns_zone" ]; do
-    read -r gcp_dns_zone </dev/tty
-    [ -n "$gcp_dns_zone" ] || printf "DNS zone (required): " >/dev/tty
-  done
+  local gcp_dns_zone
+  ask_required gcp_dns_zone "DNS zone (e.g. example.com)"
 
   echo "" >/dev/tty
   info "acme_email is used by cert-manager to register a Let's Encrypt ACME account and issue the wildcard TLS certificate for your domain — registration fails without a real address." >/dev/tty
-  local gcp_acme_email=""
-  printf "ACME email: " >/dev/tty
-  while [ -z "$gcp_acme_email" ]; do
-    read -r gcp_acme_email </dev/tty
-    [ -n "$gcp_acme_email" ] || printf "ACME email (required): " >/dev/tty
-  done
+  local gcp_acme_email
+  ask_required gcp_acme_email "ACME email"
 
   echo "" >/dev/tty
   echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
@@ -850,37 +865,17 @@ deploy_gcp() {
       case "$email_choice" in
         1|sendgrid|SendGrid)
           email_provider="sendgrid"
-          printf "SendGrid API key: " >/dev/tty
-          while [ -z "$sendgrid_api_key" ]; do
-            read -r sendgrid_api_key </dev/tty
-            [ -n "$sendgrid_api_key" ] || printf "SendGrid API key (required): " >/dev/tty
-          done
-          printf "SendGrid from-email: " >/dev/tty
-          while [ -z "$sendgrid_from_email" ]; do
-            read -r sendgrid_from_email </dev/tty
-            [ -n "$sendgrid_from_email" ] || printf "SendGrid from-email (required): " >/dev/tty
-          done
+          ask_required sendgrid_api_key "SendGrid API key"
+          ask_required sendgrid_from_email "SendGrid from-email"
           ;;
         2|ses|SES)
           email_provider="ses"
           printf "AWS SES region [us-east-1]: " >/dev/tty
           read -r ses_aws_region </dev/tty
           ses_aws_region="${ses_aws_region:-us-east-1}"
-          printf "AWS access key ID: " >/dev/tty
-          while [ -z "$aws_access_key_id" ]; do
-            read -r aws_access_key_id </dev/tty
-            [ -n "$aws_access_key_id" ] || printf "AWS access key ID (required): " >/dev/tty
-          done
-          printf "AWS secret access key: " >/dev/tty
-          while [ -z "$aws_secret_access_key" ]; do
-            read -r aws_secret_access_key </dev/tty
-            [ -n "$aws_secret_access_key" ] || printf "AWS secret access key (required): " >/dev/tty
-          done
-          printf "SES from-email: " >/dev/tty
-          while [ -z "$aws_ses_from_email" ]; do
-            read -r aws_ses_from_email </dev/tty
-            [ -n "$aws_ses_from_email" ] || printf "SES from-email (required): " >/dev/tty
-          done
+          ask_required aws_access_key_id "AWS access key ID"
+          ask_required aws_secret_access_key "AWS secret access key"
+          ask_required aws_ses_from_email "SES from-email"
           ;;
         *) die "Invalid choice: $email_choice" ;;
       esac
@@ -1153,31 +1148,6 @@ check_aws_permissions() {
   success "AWS permissions verified for ${caller_arn}"
 }
 
-# Mirrors detect_gcp_partial_deploy's intent exactly, adapted to this repo's
-# file names (a generated secrets file instead of a deployer-key JSON, and a
-# single backend-<env>.tfbackend instead of GCP's naming) — see that
-# function's own comment for why this deliberately doesn't try to guess
-# whether the previous run succeeded, failed, or is mid-DNS-wait.
-detect_aws_partial_deploy() {
-  [ -d "$AWS_DEPLOY_DIR" ] || return 0
-  local tfvars_dir="${AWS_DEPLOY_DIR}/env"
-  [ -d "$tfvars_dir" ] || return 0
-
-  local candidate
-  candidate=$(ls -t "${tfvars_dir}"/*.tfvars 2>/dev/null | grep -v '/customer\.tfvars$' | head -1 || true)
-  [ -n "$candidate" ] || return 0
-
-  local env_name
-  env_name=$(basename "$candidate" .tfvars)
-
-  local secrets_file="${AWS_DEPLOY_DIR}/.self-deploy/${env_name}-generated-secrets.txt"
-  local backend_file="${tfvars_dir}/backend-${env_name}.tfbackend"
-
-  [ -f "$secrets_file" ] || [ -f "$backend_file" ] || return 0
-
-  echo "$env_name"
-}
-
 deploy_aws() {
   local token="$1"
 
@@ -1209,12 +1179,8 @@ deploy_aws() {
 
   echo "" >/dev/tty
   info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates a Route53 zone under it, which you'll delegate to AWS's nameservers at your registrar afterward." >/dev/tty
-  local aws_dns_zone=""
-  printf "DNS zone (e.g. example.com): " >/dev/tty
-  while [ -z "$aws_dns_zone" ]; do
-    read -r aws_dns_zone </dev/tty
-    [ -n "$aws_dns_zone" ] || printf "DNS zone (required): " >/dev/tty
-  done
+  local aws_dns_zone
+  ask_required aws_dns_zone "DNS zone (e.g. example.com)"
 
   echo "" >/dev/tty
   echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
@@ -1234,39 +1200,17 @@ deploy_aws() {
       case "$email_choice" in
         1|sendgrid|SendGrid)
           email_provider="sendgrid"
-          printf "SendGrid API key: " >/dev/tty
-          while [ -z "$sendgrid_api_key" ]; do
-            read -rs sendgrid_api_key </dev/tty
-            [ -n "$sendgrid_api_key" ] || printf "\nSendGrid API key (required): " >/dev/tty
-          done
-          echo "" >/dev/tty
-          printf "SendGrid from-email: " >/dev/tty
-          while [ -z "$sendgrid_from_email" ]; do
-            read -r sendgrid_from_email </dev/tty
-            [ -n "$sendgrid_from_email" ] || printf "SendGrid from-email (required): " >/dev/tty
-          done
+          ask_required sendgrid_api_key "SendGrid API key" -s
+          ask_required sendgrid_from_email "SendGrid from-email"
           ;;
         2|ses|SES)
           email_provider="ses"
           printf "AWS SES region [us-east-1]: " >/dev/tty
           read -r ses_aws_region </dev/tty
           ses_aws_region="${ses_aws_region:-us-east-1}"
-          printf "AWS access key ID: " >/dev/tty
-          while [ -z "$aws_ses_access_key_id" ]; do
-            read -r aws_ses_access_key_id </dev/tty
-            [ -n "$aws_ses_access_key_id" ] || printf "AWS access key ID (required): " >/dev/tty
-          done
-          printf "AWS secret access key: " >/dev/tty
-          while [ -z "$aws_ses_secret_access_key" ]; do
-            read -rs aws_ses_secret_access_key </dev/tty
-            [ -n "$aws_ses_secret_access_key" ] || printf "\nAWS secret access key (required): " >/dev/tty
-          done
-          echo "" >/dev/tty
-          printf "SES from-email: " >/dev/tty
-          while [ -z "$aws_ses_from_email" ]; do
-            read -r aws_ses_from_email </dev/tty
-            [ -n "$aws_ses_from_email" ] || printf "SES from-email (required): " >/dev/tty
-          done
+          ask_required aws_ses_access_key_id "AWS access key ID"
+          ask_required aws_ses_secret_access_key "AWS secret access key" -s
+          ask_required aws_ses_from_email "SES from-email"
           ;;
         *) die "Invalid choice: $email_choice" ;;
       esac
@@ -1455,7 +1399,7 @@ main() {
   # prior run succeeded, failed, or is still stuck — the user already saw its
   # logs and knows better than any local-file heuristic could.
   local partial_env
-  partial_env=$(detect_gcp_partial_deploy)
+  partial_env=$(detect_partial_deploy "$GCP_DEPLOY_DIR" "-deployer-key.json")
   if [ -n "$partial_env" ]; then
     echo "" >/dev/tty
     warn "Found previous run artifacts for GCP env '${partial_env}'." >/dev/tty
@@ -1479,12 +1423,13 @@ main() {
     esac
   fi
 
-  # Same check for a previous AWS run — see detect_aws_partial_deploy's own
-  # comment for why this is a separate check from the GCP one above rather
-  # than a shared one keyed on provider: the two deploy dirs, tfvars
-  # templates, and resume artifacts are all different.
+  # Same check for a previous AWS run, same detect_partial_deploy helper —
+  # this one's still handled as its own separate block rather than a loop
+  # over providers, since everything past the detect call (resume prompt,
+  # which tfvars fields to read back, which *_run function to call) is
+  # still provider-specific.
   local partial_aws_env
-  partial_aws_env=$(detect_aws_partial_deploy)
+  partial_aws_env=$(detect_partial_deploy "$AWS_DEPLOY_DIR" "-generated-secrets.txt")
   if [ -n "$partial_aws_env" ]; then
     echo "" >/dev/tty
     warn "Found previous run artifacts for AWS env '${partial_aws_env}'." >/dev/tty
