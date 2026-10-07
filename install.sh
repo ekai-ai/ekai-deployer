@@ -342,9 +342,13 @@ PYEOF
   # Redeem the exchange token for the deploy token + email
   info "Redeeming token…" >/dev/tty
   local redeem_response
+  # || true: under set -e, a failing command inside a bare var=$(...)
+  # assignment kills the script right there -- the die below would never
+  # run otherwise (confirmed: without this, a curl failure here exits
+  # silently, no message, before the empty-token check ever executes).
   redeem_response=$(curl -s -X POST "${PORTAL_URL}/api/auth/exchange-token/redeem" \
     -H "Content-Type: application/json" \
-    -d "{\"exchangeToken\":\"${exchange_token}\"}")
+    -d "{\"exchangeToken\":\"${exchange_token}\"}" || true)
 
   local deploy_token
   local user_email
@@ -353,6 +357,9 @@ PYEOF
 
   if [ -z "$deploy_token" ]; then
     die "Failed to redeem token. Please re-run the installer and try again."
+  fi
+  if [ -z "$user_email" ]; then
+    warn "Could not read your email back from the portal response -- account seeding will be skipped for the local Docker path (cloud deploys aren't affected)." >/dev/tty
   fi
 
   printf '%s\n%s' "$deploy_token" "$user_email"
@@ -716,6 +723,9 @@ check_gcp_permissions() {
   access_token=$(gcloud auth print-access-token 2>/dev/null || true)
   [ -n "$access_token" ] || die "No active gcloud access token. Run: gcloud auth login"
 
+  # || true: a failing curl here would otherwise kill the script right at
+  # this assignment under set -e, before the error-message check below ever
+  # runs.
   local response
   response=$(curl -s -X POST \
     "https://cloudresourcemanager.googleapis.com/v3/projects/${project_id}:testIamPermissions" \
@@ -727,7 +737,7 @@ check_gcp_permissions() {
       "iam.serviceAccountKeys.create",
       "resourcemanager.projects.setIamPolicy",
       "storage.buckets.create"
-    ]}')
+    ]}' || true)
 
   if echo "$response" | grep -q '"error"'; then
     error "GCP rejected the permission check for project ${project_id}:"
@@ -1104,8 +1114,14 @@ check_aws_prereqs() {
 # real permission gaps earlier, not a new approach invented just for this
 # check.
 check_aws_permissions() {
+  # || true throughout this function: under set -e, a failing command
+  # inside a bare var=$(...) assignment kills the script right there --
+  # every die/warn below would silently never run otherwise (verified:
+  # even the `if [ $? -ne 0 ]` pattern further down doesn't save you, since
+  # set -e fires on the assignment itself, before that check is ever
+  # reached).
   local caller_arn
-  caller_arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)
+  caller_arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || true)
   [ -n "$caller_arn" ] || die "Could not determine the current AWS identity. Run: aws configure"
 
   # simulate-principal-policy rejects an assumed-role ARN outright (SSO
@@ -1123,7 +1139,7 @@ check_aws_permissions() {
   if [[ "$caller_arn" == *:assumed-role/* ]]; then
     local role_name real_role_arn
     role_name=$(echo "$caller_arn" | cut -d/ -f2)
-    real_role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null)
+    real_role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null || true)
     if [ -n "$real_role_arn" ] && [ "$real_role_arn" != "None" ]; then
       policy_arn="$real_role_arn"
     else
@@ -1133,7 +1149,13 @@ check_aws_permissions() {
     fi
   fi
 
-  local response
+  # `cmd && rc=$? || rc=$?` instead of a bare assignment + `if [ $? -ne 0 ]`
+  # afterward -- that pattern looks like it handles failure but doesn't
+  # under set -e: the assignment's own failure exits the script before the
+  # separate `if` line is ever reached. This form never lets the failure
+  # propagate as the statement's own exit status, so set -e stays quiet and
+  # $rc reliably holds the real code either way.
+  local response rc
   response=$(aws iam simulate-principal-policy \
     --policy-source-arn "$policy_arn" \
     --action-names \
@@ -1142,8 +1164,8 @@ check_aws_permissions() {
       iam:ListAccessKeys iam:CreateAccessKey iam:DeleteAccessKey iam:UpdateAccessKey \
       iam:GetPolicy iam:GetPolicyVersion iam:ListPolicyVersions \
       iam:CreatePolicy iam:CreatePolicyVersion iam:DeletePolicyVersion \
-    --output json 2>&1)
-  if [ $? -ne 0 ]; then
+    --output json 2>&1) && rc=$? || rc=$?
+  if [ "$rc" -ne 0 ]; then
     error "Could not run the IAM permission check for ${caller_arn}:"
     echo "$response" >&2
     die "Check AWS credentials are valid (aws sts get-caller-identity) and re-run."
@@ -1425,8 +1447,11 @@ main() {
         local tfvars_file="${tfvars_dir}/${partial_env}.tfvars"
         local resume_project_id
         local resume_dns_zone
-        resume_project_id=$(grep -E '^project_id[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
-        resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+        # || true: pipefail means a no-match grep fails the whole pipeline
+        # even though head/sed after it succeed -- same silent-death risk
+        # under set -e as every other var=$(...) in this file.
+        resume_project_id=$(grep -E '^project_id[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' || true)
+        resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' || true)
         [ -n "$resume_project_id" ] || die "Could not read project_id back from ${tfvars_file} — fix or delete it and start a new deployment."
         deploy_gcp_run "$resume_project_id" "$partial_env" "$resume_dns_zone"
         return
@@ -1454,7 +1479,10 @@ main() {
           local tfvars_dir="${AWS_DEPLOY_DIR}/env"
           local tfvars_file="${tfvars_dir}/${partial_aws_env}.tfvars"
           local resume_dns_zone
-          resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
+          # || true: pipefail means a no-match grep fails the whole pipeline
+          # even though head/sed after it succeed -- same silent-death risk
+          # under set -e as every other var=$(...) in this file.
+          resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' || true)
           deploy_aws_run "$partial_aws_env" "$resume_dns_zone"
           return
         else
