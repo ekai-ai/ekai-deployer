@@ -1110,15 +1110,27 @@ check_aws_permissions() {
 
   # simulate-principal-policy rejects an assumed-role ARN outright (SSO
   # logins and anything else that goes through AssumeRole all show up as
-  # one) -- it only takes a real user/group/role ARN. Swap in the
-  # underlying role for the simulate call; keep caller_arn as-is for the
-  # messages below, since that's the identity the person actually knows.
+  # one) -- it only takes a real user/group/role ARN. Can't just prepend
+  # role/<name> to rebuild it either: an assumed-role ARN never carries the
+  # role's path, and SSO permission-set roles live under
+  # /aws-reserved/sso.amazonaws.com/<region>/ -- guessing "no path" there
+  # builds an ARN that doesn't exist. Look the role up by name instead (AWS
+  # resolves role names uniquely account-wide, path or not, so this doesn't
+  # need to know or guess the path) and use whatever ARN it actually hands
+  # back. keep caller_arn as-is for the messages below either way, since
+  # that's the identity the person actually knows.
   local policy_arn="$caller_arn"
   if [[ "$caller_arn" == *:assumed-role/* ]]; then
-    local account role_name
-    account=$(echo "$caller_arn" | cut -d: -f5)
+    local role_name real_role_arn
     role_name=$(echo "$caller_arn" | cut -d/ -f2)
-    policy_arn="arn:aws:iam::${account}:role/${role_name}"
+    real_role_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null)
+    if [ -n "$real_role_arn" ] && [ "$real_role_arn" != "None" ]; then
+      policy_arn="$real_role_arn"
+    else
+      warn "Could not look up the real ARN for role '${role_name}' (needs iam:GetRole) -- skipping the permission pre-check. self-deploy.sh will still fail clearly later if something's actually missing."
+      success "Continuing without a permission pre-check for ${caller_arn}"
+      return 0
+    fi
   fi
 
   local response
