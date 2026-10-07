@@ -865,7 +865,7 @@ deploy_gcp() {
       case "$email_choice" in
         1|sendgrid|SendGrid)
           email_provider="sendgrid"
-          ask_required sendgrid_api_key "SendGrid API key"
+          ask_required sendgrid_api_key "SendGrid API key" -s
           ask_required sendgrid_from_email "SendGrid from-email"
           ;;
         2|ses|SES)
@@ -874,7 +874,7 @@ deploy_gcp() {
           read -r ses_aws_region </dev/tty
           ses_aws_region="${ses_aws_region:-us-east-1}"
           ask_required aws_access_key_id "AWS access key ID"
-          ask_required aws_secret_access_key "AWS secret access key"
+          ask_required aws_secret_access_key "AWS secret access key" -s
           ask_required aws_ses_from_email "SES from-email"
           ;;
         *) die "Invalid choice: $email_choice" ;;
