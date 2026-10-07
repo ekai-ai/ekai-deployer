@@ -1261,8 +1261,8 @@ deploy_aws() {
   # sed doesn't support it; it silently no-ops instead of erroring, which
   # would leave every "customer" placeholder in place with no warning).
   sed \
-    -e "s/^region = \"us-east-1\"/region = \"${aws_region}\"/" \
-    -e "s/^env = \"customer\"/env = \"${aws_env}\"/" \
+    -e "s/^region[[:space:]]*=[[:space:]]*\"us-east-1\"/region = \"${aws_region}\"/" \
+    -e "s/^env[[:space:]]*=[[:space:]]*\"customer\"/env = \"${aws_env}\"/" \
     -e "s/^dns_zone[[:space:]]*=[[:space:]]*\"customer.ekai.ai\".*/dns_zone        = \"${aws_dns_zone}\"/" \
     "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
 
