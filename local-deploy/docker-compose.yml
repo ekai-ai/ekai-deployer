@@ -82,42 +82,6 @@ services:
       - "7687:7687"
     restart: unless-stopped
 
-  langfuse-minio:
-    image: quay.io/minio/minio:latest
-    container_name: langfuse-minio
-    ports:
-      - "9090:9000"
-      - "9091:9001"
-    environment:
-      - MINIO_ROOT_USER=langfuse
-      - MINIO_ROOT_PASSWORD=langfuse123
-    volumes:
-      - minio-data:/data
-    command: server /data --console-address ':9001'
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  minio-init:
-    image: quay.io/minio/mc:latest
-    container_name: minio-init
-    depends_on:
-      langfuse-minio:
-        condition: service_healthy
-    environment:
-      - MINIO_ROOT_USER=langfuse
-      - MINIO_ROOT_PASSWORD=langfuse123
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set myminio http://langfuse-minio:9000 langfuse langfuse123;
-      mc mb myminio/ekai-files --ignore-existing;
-      mc mb myminio/langfuse-events --ignore-existing;
-      exit 0;
-      "
-
   # ─── AI-Core app ─────────────────────────────────────────────────────────────
 
   ekai-erd:
@@ -138,6 +102,12 @@ services:
       - SANDBOX_REQUIRED=${SANDBOX_REQUIRED:-true}
     depends_on:
       - erd-redis-stack
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /run/ekai/license"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
     restart: unless-stopped
 
   ekai-ai-core-worker:
@@ -168,6 +138,8 @@ services:
     depends_on:
       erd-redis-stack:
         condition: service_healthy
+      ekai-erd:
+        condition: service_healthy
     deploy:
       replicas: 1
       resources:
@@ -195,6 +167,8 @@ services:
     depends_on:
       erd-redis-stack:
         condition: service_healthy
+      ekai-erd:
+        condition: service_healthy
     deploy:
       replicas: 1
       resources:
@@ -221,6 +195,8 @@ services:
     depends_on:
       erd-redis-stack:
         condition: service_healthy
+      ekai-erd:
+        condition: service_healthy
     deploy:
       replicas: 2
       resources:
@@ -235,7 +211,6 @@ services:
 volumes:
   ekai_postgres_data:
   redis-data:
-  minio-data:
   neo4j-logs:
   neo4j-data:
   neo4j-config:
