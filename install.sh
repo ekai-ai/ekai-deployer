@@ -646,8 +646,8 @@ deploy_local() {
   # Seed the user account if we have an email and it isn't already there.
   local user_exists=""
   if [ -n "$user_email" ] && [ "$is_rerun" = "1" ]; then
-    user_exists=$(docker exec "$PG_CONTAINER" psql -U ekai -d ekaibackend -tAq \
-      -c "SELECT 1 FROM \"Users\" WHERE email = '${user_email}' LIMIT 1;" 2>/dev/null || true)
+    user_exists=$(printf '%s\n' "SELECT 1 FROM \"Users\" WHERE email = :'email' LIMIT 1;" \
+      | docker exec -i "$PG_CONTAINER" psql -U ekai -d ekaibackend -tAq -v email="${user_email}" 2>/dev/null || true)
   fi
   if [ "$user_exists" = "1" ]; then
     success "Account for ${user_email} already exists — skipping user seeding"
@@ -685,8 +685,8 @@ LIMIT 1
 ON CONFLICT DO NOTHING;
 SQL
     local seeded_email
-    seeded_email=$(docker exec ekai-postgres psql -U ekai -d ekaibackend -tAq \
-      -v email="${user_email}" -c "SELECT email FROM \"Users\" WHERE email = :'email' LIMIT 1;" 2>/dev/null || true)
+    seeded_email=$(printf '%s\n' "SELECT email FROM \"Users\" WHERE email = :'email' LIMIT 1;" \
+      | docker exec -i ekai-postgres psql -U ekai -d ekaibackend -tAq -v email="${user_email}" 2>/dev/null || true)
     if [ "$seeded_email" = "$user_email" ]; then
       success "Account ready for ${user_email}"
     else
