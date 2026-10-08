@@ -21,6 +21,12 @@ COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
 COMPOSE_FILE="docker-compose.yml"
+LOCAL_DIR="ekai-local-deployment" # relative to cwd; holds the local deploy's compose + env
+NORTHWIND_DIR_URL="${BASE_URL}/local-deploy/northwind"  # load.sh + setup.sql
+NORTHWIND_DB="northwind"
+NORTHWIND_USER="northwind"
+NORTHWIND_PASSWORD="northwind"
+PG_CONTAINER="ekai-postgres"
 GCP_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-google-ekai/archive/refs/heads/main.tar.gz"
 GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
 AWS_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-aws-ekai/archive/refs/heads/main.tar.gz"
@@ -154,6 +160,13 @@ install_cmd_for() {
       echo "sudo apt-get install -y dnsutils" ;;
     dig:dnf|dig:yum)
       echo "sudo ${mgr} install -y bind-utils" ;;
+    docker-compose:apt-get)
+      # docker-compose-plugin lives in Docker's own repo, not the distro's, so
+      # add it first — the distro's docker.io package is what leaves a machine
+      # with a daemon but no Compose in the first place.
+      echo 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg && echo "deb [signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list && sudo apt-get update && sudo apt-get install -y docker-compose-plugin' ;;
+    docker-compose:dnf|docker-compose:yum)
+      echo "sudo ${mgr} config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && sudo ${mgr} install -y docker-compose-plugin" ;;
   esac
 }
 
@@ -395,6 +408,44 @@ detect_arch() {
   esac
 }
 
+# v2 required: the compose file is Compose Spec, which v1 can't run.
+# String not array — bash 3.2 (macOS) errors on empty array + set -u.
+COMPOSE=""
+
+# Remediation text for a missing/too-old Compose, using this box's package
+# manager — same install_cmd_for pattern as the other prereqs.
+compose_remediation() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "Install/update Docker Desktop, which bundles Compose v2 — https://www.docker.com/products/docker-desktop/"
+    return
+  fi
+  local cmd
+  cmd=$(install_cmd_for docker-compose "$(detect_pkg_manager)")
+  if [ -n "$cmd" ]; then
+    echo "Install it with: ${cmd}"
+  else
+    echo "Install it — see https://docs.docker.com/compose/install/"
+  fi
+}
+
+detect_compose() {
+  if docker compose version &>/dev/null; then
+    COMPOSE="docker compose"
+    return
+  fi
+
+  if command -v docker-compose &>/dev/null; then
+    local v
+    v=$(docker-compose version --short 2>/dev/null || echo "")
+    case "$v" in
+      2.*|v2.*) COMPOSE="docker-compose"; return ;;
+      *) die "Docker Compose ${v:-v1} is too old to run this stack (v2+ required). $(compose_remediation)" ;;
+    esac
+  fi
+
+  die "Docker Compose is not installed (v2+ required). $(compose_remediation)"
+}
+
 check_local_requirements() {
   reset_missing_tools
   need docker "Install Docker Desktop from https://www.docker.com/products/docker-desktop/ (on WSL2, install it on Windows and enable WSL2 integration for this distro in Docker Desktop → Settings → Resources → WSL Integration)."
@@ -404,6 +455,10 @@ check_local_requirements() {
   # to `docker info`), so it still has to fail fast on its own.
   docker info &>/dev/null || die "Docker is not running. Please start Docker Desktop and re-run."
   success "Docker is running"
+
+  # Compose must be resolved before any $COMPOSE call below.
+  detect_compose
+  success "Docker Compose: $($COMPOSE version --short 2>/dev/null || echo "$COMPOSE")"
 
   # Remaining checks are independent of each other — run them all and only
   # report the disk-space failure (the one that's fatal) after the rest.
@@ -444,9 +499,91 @@ check_local_requirements() {
   [ "$disk_ok" -eq 1 ] || die "Free up disk space and re-run."
 }
 
+# ── Northwind sample data ─────────────────────────────────────────────────────
+# The work lives in local-deploy/northwind/{load.sh,setup.sql}; this file only
+# prompts, fetches them and runs load.sh.
+NORTHWIND_LOADED=0
+
+# Existing local install = our postgres container exists (running or stopped).
+local_install_exists() {
+  command -v docker &>/dev/null || return 1
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER"
+}
+
+# y/N prompt on the tty. $2 = default answer (y|n).
+ask_yes_no() {
+  local prompt="$1" default="${2:-n}" answer hint="[y/N]"
+  [ "$default" = "y" ] && hint="[Y/n]"
+  printf "%s %s " "$prompt" "$hint" >/dev/tty
+  read -r answer </dev/tty
+  answer="${answer:-$default}"
+  case "$answer" in y|Y|yes|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# Runs load.sh with the given subcommand (exists|load) from a temp dir.
+run_northwind() {
+  local dir rc=0
+  dir=$(mktemp -d)
+  curl -fsSL "${NORTHWIND_DIR_URL}/load.sh" -o "${dir}/load.sh" \
+    && curl -fsSL "${NORTHWIND_DIR_URL}/setup.sql" -o "${dir}/setup.sql" \
+    || { rm -rf "$dir"; die "Could not download the Northwind sample data scripts."; }
+  bash "${dir}/load.sh" "$1" "$NORTHWIND_DB" "$NORTHWIND_USER" "$NORTHWIND_PASSWORD" || rc=$?
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# $1 = "ask" (rerun: always prompt, default No) or "auto" (fresh install: load
+# without a question). An already-existing northwind DB always prompts, since
+# loading replaces everything in it.
+maybe_load_northwind() {
+  local mode="${1:-ask}"
+  local choice="${EKAI_LOAD_SAMPLE_DATA:-}"
+  case "$choice" in no|No|NO|false|0) info "Skipping Northwind sample data (EKAI_LOAD_SAMPLE_DATA=no)."; return 0 ;; esac
+
+  # Stopped install (e.g. user said no to redeploy): don't hang waiting on it.
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PG_CONTAINER" \
+    || die "${PG_CONTAINER} is not running. Start Ekai first (or choose to redeploy) and re-run."
+
+  local exists=0
+  run_northwind exists && exists=1
+  if [ "$mode" = "ask" ] || [ "$exists" = "1" ]; then
+    echo "" >/dev/tty
+    echo "${bold}Northwind sample data${reset} is a demo dataset for trying Ekai without your own data." >/dev/tty
+    echo "It goes into its own '${NORTHWIND_DB}' database, never into Ekai's own." >/dev/tty
+    warn "If '${NORTHWIND_DB}' already exists, ALL of its contents (data and any schemas or dbt models you created there) will be overwritten." >/dev/tty
+    case "$choice" in
+      yes|Yes|YES|true|1) ;;
+      *) ask_yes_no "Load the Northwind sample data?" n || { info "Skipping Northwind sample data."; return 0; } ;;
+    esac
+  fi
+  run_northwind load || die "Northwind sample data load failed."
+  NORTHWIND_LOADED=1
+}
+
+print_northwind_info() {
+  [ "$NORTHWIND_LOADED" = "1" ] || return 0
+  echo ""
+  echo "${bold}Northwind sample data${reset} — add it with the Postgres connector:"
+  echo "  Host:      ekai-postgres   (not localhost — Ekai connects from inside Docker)"
+  echo "  Port:      5432"
+  echo "  Database:  ${NORTHWIND_DB}"
+  echo "  User:      ${NORTHWIND_USER}"
+  echo "  Password:  ${NORTHWIND_PASSWORD}"
+  echo "  Schema:    public"
+  echo "  Use SSL:   off  (the bundled Postgres has no SSL)"
+}
+
 deploy_local() {
   local token="$1"
   local user_email="${2:-}"
+  local is_rerun="${3:-0}"
+
+  # Keep the compose file and .env in their own directory rather than scattering
+  # them in the cwd. Entered before the disk-space check so `df .` measures the
+  # mount we actually deploy onto.
+  mkdir -p "$LOCAL_DIR"
+  cd "$LOCAL_DIR"
+  success "Using ${bold}$(pwd)${reset}"
 
   check_local_requirements
 
@@ -496,18 +633,25 @@ deploy_local() {
   echo ""
   info "Pulling images…"
   local svc
-  for svc in $(docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app config --services); do
+  for svc in $($COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" config --services); do
     info "Pulling ${svc}…"
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app pull "$svc"
+    $COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull "$svc"
   done
 
   # Bring up the stack
   echo ""
   info "Starting ekai with Docker Compose…"
-  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" --profile app up -d --force-recreate
+  $COMPOSE -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --force-recreate
 
-  # Seed the user account if we have an email
-  if [ -n "$user_email" ]; then
+  # Seed the user account if we have an email and it isn't already there.
+  local user_exists=""
+  if [ -n "$user_email" ] && [ "$is_rerun" = "1" ]; then
+    user_exists=$(docker exec "$PG_CONTAINER" psql -U ekai -d ekaibackend -tAq \
+      -c "SELECT 1 FROM \"Users\" WHERE email = '${user_email}' LIMIT 1;" 2>/dev/null || true)
+  fi
+  if [ "$user_exists" = "1" ]; then
+    success "Account for ${user_email} already exists — skipping user seeding"
+  elif [ -n "$user_email" ]; then
     info "Waiting for database migrations to complete…"
     until docker exec ekai-postgres psql -U ekai -d ekaibackend -c '\dt "Users"' 2>/dev/null | grep -q Users; do
       sleep 3
@@ -550,13 +694,22 @@ SQL
     fi
   fi
 
+  if [ "$is_rerun" = "1" ]; then
+    maybe_load_northwind ask
+  else
+    maybe_load_northwind auto
+  fi
+
   echo ""
   success "Ekai is running!"
   echo ""
   echo "  ${bold}Ekai:${reset}   http://localhost:80"
+  echo "  ${bold}Files:${reset}  $(pwd)"
+  print_northwind_info
   echo ""
-  echo "To stop:   ${bold}docker compose -f ${COMPOSE_FILE} --profile app down${reset}"
-  echo "To update: ${bold}for s in \$(docker compose -f ${COMPOSE_FILE} --profile app config --services); do docker compose -f ${COMPOSE_FILE} --profile app pull \"\$s\"; done && docker compose -f ${COMPOSE_FILE} --profile app up -d${reset}"
+  echo "From ${bold}$(pwd)${reset}:"
+  echo "To stop:   ${bold}${COMPOSE} -f ${COMPOSE_FILE} down${reset}"
+  echo "To update: ${bold}for s in \$(${COMPOSE} -f ${COMPOSE_FILE} config --services); do ${COMPOSE} -f ${COMPOSE_FILE} pull \"\$s\"; done && ${COMPOSE} -f ${COMPOSE_FILE} up -d${reset}"
 }
 
 # ── Cloud deployment ──────────────────────────────────────────────────────────
@@ -1494,22 +1647,37 @@ main() {
     esac
   fi
 
-  # Get deploy token + user email via browser login
-  local token_output
-  token_output=$(get_token_via_browser)
-  local token
-  local user_email
-  token=$(printf '%s' "$token_output" | head -1)
-  user_email=$(printf '%s' "$token_output" | tail -1)
-  success "Deploy token received"
-
   # Deployment type
   local deploy_type
   deploy_type=$(ask_deployment_type)
 
+  local token_output token user_email
   if [ "$deploy_type" = "local" ]; then
-    deploy_local "$token" "$user_email"
+    local is_rerun=0
+    if local_install_exists; then
+      warn "A local Ekai deployment already exists on this machine."
+      if ask_yes_no "Redeploy it?" n; then
+        is_rerun=1
+      else
+        # No redeploy, no token needed: just offer the sample data.
+        maybe_load_northwind ask
+        print_northwind_info
+        return
+      fi
+    fi
+
+    # Get deploy token + user email via browser login
+    token_output=$(get_token_via_browser)
+    token=$(printf '%s' "$token_output" | head -1)
+    user_email=$(printf '%s' "$token_output" | tail -1)
+    success "Deploy token received"
+    deploy_local "$token" "$user_email" "$is_rerun"
   else
+    token_output=$(get_token_via_browser)
+    token=$(printf '%s' "$token_output" | head -1)
+    user_email=$(printf '%s' "$token_output" | tail -1)
+    success "Deploy token received"
+
     local provider
     provider=$(ask_cloud_provider)
 
