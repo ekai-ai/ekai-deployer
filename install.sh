@@ -9,7 +9,7 @@ set -euo pipefail
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
-DEPLOYER_BRANCH="dev"  # dev | staging | main
+DEPLOYER_BRANCH="staging"  # dev | staging | main
 if [ "$DEPLOYER_BRANCH" = "main" ]; then
   PORTAL_URL="https://licensing.ekai.ai"
 else
