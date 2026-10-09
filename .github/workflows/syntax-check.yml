@@ -1,0 +1,13 @@
+name: Syntax check
+
+on:
+  pull_request:
+  push:
+    branches: [dev, staging, main]
+
+jobs:
+  bash-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install.sh

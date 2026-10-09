@@ -9,14 +9,14 @@ set -euo pipefail
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
-DEPLOYER_BRANCH="staging"  # dev | staging | main
-if [ "$DEPLOYER_BRANCH" = "main" ]; then
+DEPLOYER_ENV="staging"  # dev | staging | main
+if [ "$DEPLOYER_ENV" = "main" ]; then
   PORTAL_URL="https://licensing.ekai.ai"
 else
-  PORTAL_URL="https://${DEPLOYER_BRANCH}.licensing.ekai.ai"
+  PORTAL_URL="https://${DEPLOYER_ENV}.licensing.ekai.ai"
 fi
 CALLBACK_PORT="${EKAI_CALLBACK_PORT:-9999}"
-BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/${DEPLOYER_BRANCH}"
+BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/${DEPLOYER_ENV}"
 COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
@@ -46,8 +46,19 @@ AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 # have already buffered an unknown amount of this script's own source out
 # of it by this point.
 if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
-  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX.sh)
-  if curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
+  # Drain whatever curl | bash's own curl is still writing into our stdin
+  # pipe, in the background, discarding it -- we don't need the rest (we
+  # re-download a fresh complete copy below instead). Without this, the
+  # `< /dev/tty` redirect on the exec below closes this pipe's read end
+  # while curl may still be mid-write, and curl exits with "curl: (23)
+  # Failure writing output to destination".
+  cat <&0 >/dev/null &
+  # No .sh suffix: BSD mktemp (macOS) only randomizes a trailing run of X's
+  # -- X's followed by a suffix are left completely literal, so every run
+  # tried to create the exact same /tmp/ekai-install-XXXXXX.sh and failed
+  # with "File exists" the moment a prior run's copy was still there.
+  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX 2>/dev/null || true)
+  if [ -n "$SELF_COPY" ] && curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
     chmod +x "$SELF_COPY"
     EKAI_INSTALL_REEXEC=1 exec bash "$SELF_COPY" "$@" < /dev/tty
   else
