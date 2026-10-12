@@ -6,6 +6,17 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Everything below needs a real controlling terminal -- the re-exec further
+# down redirects from /dev/tty, and most of the script prompts for input via
+# `read ... < /dev/tty`. Fail fast with a clear message instead of letting
+# some read deep in the script die with a cryptic "/dev/tty: No such device
+# or address" when there's no terminal at all (CI, nohup, any other fully
+# non-interactive context).
+if ! { : < /dev/tty; } 2>/dev/null; then
+  echo "ERROR: this installer needs an interactive terminal (it prompts for input and redirects via /dev/tty) -- it can't run in a non-interactive context." >&2
+  exit 1
+fi
+
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
@@ -46,20 +57,31 @@ AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 # have already buffered an unknown amount of this script's own source out
 # of it by this point.
 if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
-  # Drain whatever curl | bash's own curl is still writing into our stdin
-  # pipe, in the background, discarding it -- we don't need the rest (we
-  # re-download a fresh complete copy below instead). Without this, the
-  # `< /dev/tty` redirect on the exec below closes this pipe's read end
-  # while curl may still be mid-write, and curl exits with "curl: (23)
-  # Failure writing output to destination".
-  cat <&0 >/dev/null &
   # No .sh suffix: BSD mktemp (macOS) only randomizes a trailing run of X's
   # -- X's followed by a suffix are left completely literal, so every run
   # tried to create the exact same /tmp/ekai-install-XXXXXX.sh and failed
   # with "File exists" the moment a prior run's copy was still there.
-  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX 2>/dev/null || true)
+  # `|| true` kept, not removed -- mktemp failing here is meant to fall
+  # through to the else branch below (continue from the pipe) rather than
+  # kill the whole install under set -e. Dropped 2>/dev/null specifically so
+  # the real reason (disk full, permissions, ...) actually reaches the
+  # user instead of being silently swallowed.
+  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX || true)
   if [ -n "$SELF_COPY" ] && curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
     chmod +x "$SELF_COPY"
+    # Only drain/discard the rest of curl | bash's own pipe now, right
+    # before exec -- never before knowing we'll actually reach it. Starting
+    # this any earlier races bash's own need to keep reading ITS script
+    # from this same fd if mktemp/curl above fail instead and the else
+    # branch below runs with no exec: confirmed live, the background cat
+    # had already silently drained the rest of the script out from under
+    # bash by the time execution reached here, so everything after this
+    # whole if/fi block silently never ran, with bash exiting 0 as if it
+    # had. Without this at all, the `< /dev/tty` redirect on the exec
+    # below closes this pipe's read end while curl (the outer one, piping
+    # this whole script in) may still be mid-write, and IT exits with
+    # "curl: (23) Failure writing output to destination".
+    cat <&0 >/dev/null &
     EKAI_INSTALL_REEXEC=1 exec bash "$SELF_COPY" "$@" < /dev/tty
   else
     echo "Warning: could not re-download install.sh for a clean re-exec; continuing from the pipe as-is (live progress output may be suppressed for nested Terraform runs)." >&2
@@ -67,6 +89,18 @@ if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
   fi
 fi
 
+# We're now running as the freshly-downloaded $SELF_COPY from the exec above
+# (EKAI_INSTALL_REEXEC=1 and $0 is that temp file) -- the process that
+# created it replaced itself via exec, so it never got a chance to clean it
+# up afterward. Unlinking the still-running script file is safe (standard
+# self-deleting-script trick); the trap covers every exit path (success,
+# error under set -e, Ctrl-C), not just the happy one, so these don't pile
+# up in /tmp across repeated runs -- confirmed to be what caused the earlier
+# mktemp "File exists" collisions (same path left behind by a prior
+# successful run, before the fix was in place to randomize it properly).
+if [ -n "${EKAI_INSTALL_REEXEC:-}" ]; then
+  trap 'rm -f -- "$0"' EXIT
+fi
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 bold=$(tput bold 2>/dev/null || true)
