@@ -50,7 +50,12 @@ if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
   # -- X's followed by a suffix are left completely literal, so every run
   # tried to create the exact same /tmp/ekai-install-XXXXXX.sh and failed
   # with "File exists" the moment a prior run's copy was still there.
-  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX 2>/dev/null || true)
+  # `|| true` kept, not removed -- mktemp failing here is meant to fall
+  # through to the else branch below (continue from the pipe) rather than
+  # kill the whole install under set -e. Dropped 2>/dev/null specifically so
+  # the real reason (disk full, permissions, ...) actually reaches the
+  # user instead of being silently swallowed.
+  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX || true)
   if [ -n "$SELF_COPY" ] && curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
     chmod +x "$SELF_COPY"
     # Only drain/discard the rest of curl | bash's own pipe now, right
