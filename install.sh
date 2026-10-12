@@ -46,13 +46,6 @@ AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 # have already buffered an unknown amount of this script's own source out
 # of it by this point.
 if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
-  # Drain whatever curl | bash's own curl is still writing into our stdin
-  # pipe, in the background, discarding it -- we don't need the rest (we
-  # re-download a fresh complete copy below instead). Without this, the
-  # `< /dev/tty` redirect on the exec below closes this pipe's read end
-  # while curl may still be mid-write, and curl exits with "curl: (23)
-  # Failure writing output to destination".
-  cat <&0 >/dev/null &
   # No .sh suffix: BSD mktemp (macOS) only randomizes a trailing run of X's
   # -- X's followed by a suffix are left completely literal, so every run
   # tried to create the exact same /tmp/ekai-install-XXXXXX.sh and failed
@@ -60,6 +53,19 @@ if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
   SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX 2>/dev/null || true)
   if [ -n "$SELF_COPY" ] && curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
     chmod +x "$SELF_COPY"
+    # Only drain/discard the rest of curl | bash's own pipe now, right
+    # before exec -- never before knowing we'll actually reach it. Starting
+    # this any earlier races bash's own need to keep reading ITS script
+    # from this same fd if mktemp/curl above fail instead and the else
+    # branch below runs with no exec: confirmed live, the background cat
+    # had already silently drained the rest of the script out from under
+    # bash by the time execution reached here, so everything after this
+    # whole if/fi block silently never ran, with bash exiting 0 as if it
+    # had. Without this at all, the `< /dev/tty` redirect on the exec
+    # below closes this pipe's read end while curl (the outer one, piping
+    # this whole script in) may still be mid-write, and IT exits with
+    # "curl: (23) Failure writing output to destination".
+    cat <&0 >/dev/null &
     EKAI_INSTALL_REEXEC=1 exec bash "$SELF_COPY" "$@" < /dev/tty
   else
     echo "Warning: could not re-download install.sh for a clean re-exec; continuing from the pipe as-is (live progress output may be suppressed for nested Terraform runs)." >&2
