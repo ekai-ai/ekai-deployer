@@ -958,9 +958,19 @@ detect_partial_deploy() {
 
   # Most-recently-modified non-template tfvars file is our one candidate —
   # good enough for "did a previous run leave something behind", not meant
-  # to handle multiple concurrent in-progress envs.
-  local candidate
-  candidate=$(ls -t "${tfvars_dir}"/*.tfvars 2>/dev/null | grep -v '/customer\.tfvars$' | head -1 || true)
+  # to handle multiple concurrent in-progress envs. Glob + the `-nt` test
+  # instead of `ls -t | grep` (shellcheck SC2010) -- `-nt` is a bash/POSIX
+  # builtin on both Linux and macOS, unlike `stat`'s flags which differ
+  # between them.
+  shopt -s nullglob
+  local f candidate=""
+  for f in "${tfvars_dir}"/*.tfvars; do
+    [ "$(basename "$f")" = "customer.tfvars" ] && continue
+    if [ -z "$candidate" ] || [ "$f" -nt "$candidate" ]; then
+      candidate="$f"
+    fi
+  done
+  shopt -u nullglob
   [ -n "$candidate" ] || return 0
 
   local env_name
