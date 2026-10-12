@@ -6,17 +6,28 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Everything below needs a real controlling terminal -- the re-exec further
+# down redirects from /dev/tty, and most of the script prompts for input via
+# `read ... < /dev/tty`. Fail fast with a clear message instead of letting
+# some read deep in the script die with a cryptic "/dev/tty: No such device
+# or address" when there's no terminal at all (CI, nohup, any other fully
+# non-interactive context).
+if ! { : < /dev/tty; } 2>/dev/null; then
+  echo "ERROR: this installer needs an interactive terminal (it prompts for input and redirects via /dev/tty) -- it can't run in a non-interactive context." >&2
+  exit 1
+fi
+
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
-DEPLOYER_BRANCH="staging"  # dev | staging | main
-if [ "$DEPLOYER_BRANCH" = "main" ]; then
+DEPLOYER_ENV="staging"  # dev | staging | main
+if [ "$DEPLOYER_ENV" = "main" ]; then
   PORTAL_URL="https://licensing.ekai.ai"
 else
-  PORTAL_URL="https://${DEPLOYER_BRANCH}.licensing.ekai.ai"
+  PORTAL_URL="https://${DEPLOYER_ENV}.licensing.ekai.ai"
 fi
 CALLBACK_PORT="${EKAI_CALLBACK_PORT:-9999}"
-BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/${DEPLOYER_BRANCH}"
+BASE_URL="https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/${DEPLOYER_ENV}"
 COMPOSE_URL="${BASE_URL}/local-deploy/docker-compose.yml"
 ENV_EXAMPLE_URL="${BASE_URL}/local-deploy/.env.example"
 ENV_FILE=".env"
@@ -46,9 +57,31 @@ AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
 # have already buffered an unknown amount of this script's own source out
 # of it by this point.
 if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
-  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX.sh)
-  if curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
+  # No .sh suffix: BSD mktemp (macOS) only randomizes a trailing run of X's
+  # -- X's followed by a suffix are left completely literal, so every run
+  # tried to create the exact same /tmp/ekai-install-XXXXXX.sh and failed
+  # with "File exists" the moment a prior run's copy was still there.
+  # `|| true` kept, not removed -- mktemp failing here is meant to fall
+  # through to the else branch below (continue from the pipe) rather than
+  # kill the whole install under set -e. Dropped 2>/dev/null specifically so
+  # the real reason (disk full, permissions, ...) actually reaches the
+  # user instead of being silently swallowed.
+  SELF_COPY=$(mktemp /tmp/ekai-install-XXXXXX || true)
+  if [ -n "$SELF_COPY" ] && curl -fsSL "${BASE_URL}/install.sh" -o "$SELF_COPY"; then
     chmod +x "$SELF_COPY"
+    # Only drain/discard the rest of curl | bash's own pipe now, right
+    # before exec -- never before knowing we'll actually reach it. Starting
+    # this any earlier races bash's own need to keep reading ITS script
+    # from this same fd if mktemp/curl above fail instead and the else
+    # branch below runs with no exec: confirmed live, the background cat
+    # had already silently drained the rest of the script out from under
+    # bash by the time execution reached here, so everything after this
+    # whole if/fi block silently never ran, with bash exiting 0 as if it
+    # had. Without this at all, the `< /dev/tty` redirect on the exec
+    # below closes this pipe's read end while curl (the outer one, piping
+    # this whole script in) may still be mid-write, and IT exits with
+    # "curl: (23) Failure writing output to destination".
+    cat <&0 >/dev/null &
     EKAI_INSTALL_REEXEC=1 exec bash "$SELF_COPY" "$@" < /dev/tty
   else
     echo "Warning: could not re-download install.sh for a clean re-exec; continuing from the pipe as-is (live progress output may be suppressed for nested Terraform runs)." >&2
@@ -56,6 +89,18 @@ if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
   fi
 fi
 
+# We're now running as the freshly-downloaded $SELF_COPY from the exec above
+# (EKAI_INSTALL_REEXEC=1 and $0 is that temp file) -- the process that
+# created it replaced itself via exec, so it never got a chance to clean it
+# up afterward. Unlinking the still-running script file is safe (standard
+# self-deleting-script trick); the trap covers every exit path (success,
+# error under set -e, Ctrl-C), not just the happy one, so these don't pile
+# up in /tmp across repeated runs -- confirmed to be what caused the earlier
+# mktemp "File exists" collisions (same path left behind by a prior
+# successful run, before the fix was in place to randomize it properly).
+if [ -n "${EKAI_INSTALL_REEXEC:-}" ]; then
+  trap 'rm -f -- "$0"' EXIT
+fi
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 bold=$(tput bold 2>/dev/null || true)
@@ -947,9 +992,19 @@ detect_partial_deploy() {
 
   # Most-recently-modified non-template tfvars file is our one candidate —
   # good enough for "did a previous run leave something behind", not meant
-  # to handle multiple concurrent in-progress envs.
-  local candidate
-  candidate=$(ls -t "${tfvars_dir}"/*.tfvars 2>/dev/null | grep -v '/customer\.tfvars$' | head -1 || true)
+  # to handle multiple concurrent in-progress envs. Glob + the `-nt` test
+  # instead of `ls -t | grep` (shellcheck SC2010) -- `-nt` is a bash/POSIX
+  # builtin on both Linux and macOS, unlike `stat`'s flags which differ
+  # between them.
+  shopt -s nullglob
+  local f candidate=""
+  for f in "${tfvars_dir}"/*.tfvars; do
+    [ "$(basename "$f")" = "customer.tfvars" ] && continue
+    if [ -z "$candidate" ] || [ "$f" -nt "$candidate" ]; then
+      candidate="$f"
+    fi
+  done
+  shopt -u nullglob
   [ -n "$candidate" ] || return 0
 
   local env_name
