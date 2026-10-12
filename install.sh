@@ -73,6 +73,18 @@ if [ ! -t 0 ] && [ -z "${EKAI_INSTALL_REEXEC:-}" ]; then
   fi
 fi
 
+# We're now running as the freshly-downloaded $SELF_COPY from the exec above
+# (EKAI_INSTALL_REEXEC=1 and $0 is that temp file) -- the process that
+# created it replaced itself via exec, so it never got a chance to clean it
+# up afterward. Unlinking the still-running script file is safe (standard
+# self-deleting-script trick); the trap covers every exit path (success,
+# error under set -e, Ctrl-C), not just the happy one, so these don't pile
+# up in /tmp across repeated runs -- confirmed to be what caused the earlier
+# mktemp "File exists" collisions (same path left behind by a prior
+# successful run, before the fix was in place to randomize it properly).
+if [ -n "${EKAI_INSTALL_REEXEC:-}" ]; then
+  trap 'rm -f -- "$0"' EXIT
+fi
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 bold=$(tput bold 2>/dev/null || true)
