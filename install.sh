@@ -6,6 +6,17 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/ekai-ai/ekai-deployer/refs/heads/main/install.sh | bash
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Everything below needs a real controlling terminal -- the re-exec further
+# down redirects from /dev/tty, and most of the script prompts for input via
+# `read ... < /dev/tty`. Fail fast with a clear message instead of letting
+# some read deep in the script die with a cryptic "/dev/tty: No such device
+# or address" when there's no terminal at all (CI, nohup, any other fully
+# non-interactive context).
+if ! { : < /dev/tty; } 2>/dev/null; then
+  echo "ERROR: this installer needs an interactive terminal (it prompts for input and redirects via /dev/tty) -- it can't run in a non-interactive context." >&2
+  exit 1
+fi
+
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
