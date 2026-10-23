@@ -1644,7 +1644,7 @@ deploy_azure() {
   azure_region="${azure_region:-northeurope}"
 
   echo "" >/dev/tty
-  warn "The environment name becomes part of every Azure resource this creates (the AKS cluster, the resource group, the state storage account, ...) — it must be unique per deployment, and 20 characters or fewer (the Key Vault name folds it in, capped at 24 chars total)." >/dev/tty
+  warn "The environment name becomes part of every Azure resource this creates — it must be unique per deployment, lowercase letters/numbers only, and 11 characters or fewer. The tightest constraint is the Terraform state storage account, named \"ekaiterraform<env>\": Azure storage account names allow only lowercase letters and digits (no hyphens/underscores/uppercase) and cap at 24 chars total, and \"ekaiterraform\" alone is already 13 of those." >/dev/tty
   local azure_env=""
   while [ -z "$azure_env" ]; do
     printf "Environment name: " >/dev/tty
@@ -1655,8 +1655,11 @@ deploy_azure() {
     elif [ "$azure_env" = "customer" ]; then
       warn "\"customer\" is reserved (it's the template file itself) — pick a different environment name." >/dev/tty
       azure_env=""
-    elif [ ${#azure_env} -gt 20 ]; then
-      printf "Environment name must be 20 characters or fewer (got %d): " "${#azure_env}" >/dev/tty
+    elif [ ${#azure_env} -gt 11 ]; then
+      printf "Environment name must be 11 characters or fewer (got %d): " "${#azure_env}" >/dev/tty
+      azure_env=""
+    elif [[ ! "$azure_env" =~ ^[a-z0-9]+$ ]]; then
+      printf "Environment name must be lowercase letters and numbers only (the state storage account name can't contain anything else): " >/dev/tty
       azure_env=""
     fi
   done
