@@ -20,7 +20,7 @@ fi
 # Only line to touch when merging dev -> staging -> main — everything below
 # derives from it, so PORTAL_URL and BASE_URL can't drift out of sync with
 # each other the way they did before.
-DEPLOYER_ENV="staging"  # dev | staging | main
+DEPLOYER_ENV="dev"  # dev | staging | main
 if [ "$DEPLOYER_ENV" = "main" ]; then
   PORTAL_URL="https://licensing.ekai.ai"
 else
@@ -42,6 +42,8 @@ GCP_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-google-ekai/archive/r
 GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
 AWS_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-aws-ekai/archive/refs/heads/main.tar.gz"
 AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
+AZURE_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-azure-ekai/archive/refs/heads/main.tar.gz"
+AZURE_DEPLOY_DIR="terraform-azure-ekai" # relative to cwd, downloaded below
 
 # When run via `curl ... | bash`, this script's own stdin is a pipe, not a
 # real terminal -- and with the whole process tree rooted that way, deeply
@@ -1597,6 +1599,273 @@ deploy_aws_run() {
   echo ""
 }
 
+# ── Azure deployment ──────────────────────────────────────────────────────────
+# Checks every tool terraform-azure-ekai's self-deploy.sh needs (terraform,
+# kubectl, jq, dig -- no gcloud/gke-gcloud-auth-plugin equivalent: AKS auth
+# goes through the az CLI directly via `az aks get-credentials`, same as the
+# AWS path's own `aws`-direct EKS auth). No dedicated check_azure_permissions
+# pre-check exists yet (unlike AWS's iam:SimulatePrincipalPolicy / GCP's
+# testIamPermissions) -- terraform-azure-ekai has no PERMISSIONS.md to point
+# a failure message at yet either. self-deploy.sh still fails clearly on its
+# own if the authenticated identity lacks subscription-level rights (it
+# retries the Owner role-assignment grant 5 times, then dies with a specific
+# error naming the resource group and principal).
+check_azure_tools() {
+  reset_missing_tools
+  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
+  # self-deploy.sh's cicd apply needs kubectl to auth against the AKS
+  # cluster it just created, same reason as the AWS/GCP paths.
+  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
+  # self-deploy.sh itself needs jq to parse az CLI JSON output.
+  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
+  # self-deploy.sh polls DNS (via dig) to confirm the domain's name servers
+  # have propagated before continuing.
+  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
+
+  offer_auto_install_missing_tools
+}
+
+check_azure_prereqs() {
+  check_azure_tools
+  [ -z "$_missing_tools" ]
+}
+
+deploy_azure() {
+  local token="$1"
+
+  echo "" >/dev/tty
+  info "Your Azure subscription ID -- everything this creates (resource group, AKS, Postgres, ...) lives inside this one subscription." >/dev/tty
+  local azure_subscription_id
+  ask_required azure_subscription_id "Azure subscription ID"
+
+  printf "Azure region [northeurope]: " >/dev/tty
+  local azure_region
+  read -r azure_region </dev/tty
+  azure_region="${azure_region:-northeurope}"
+
+  echo "" >/dev/tty
+  warn "The environment name becomes part of every Azure resource this creates (the AKS cluster, the resource group, the state storage account, ...) — it must be unique per deployment, and 20 characters or fewer (the Key Vault name folds it in, capped at 24 chars total)." >/dev/tty
+  local azure_env=""
+  while [ -z "$azure_env" ]; do
+    printf "Environment name: " >/dev/tty
+    read -r azure_env </dev/tty
+    if [ -z "$azure_env" ]; then
+      printf "Environment name is required: " >/dev/tty
+      azure_env=""
+    elif [ "$azure_env" = "customer" ]; then
+      warn "\"customer\" is reserved (it's the template file itself) — pick a different environment name." >/dev/tty
+      azure_env=""
+    elif [ ${#azure_env} -gt 20 ]; then
+      printf "Environment name must be 20 characters or fewer (got %d): " "${#azure_env}" >/dev/tty
+      azure_env=""
+    fi
+  done
+
+  echo "" >/dev/tty
+  info "dns_zone is the domain (or subdomain) you control DNS for — Ekai creates an Azure DNS zone under it, which you'll delegate to Azure's nameservers at your registrar afterward." >/dev/tty
+  local azure_dns_zone
+  ask_required azure_dns_zone "DNS zone (e.g. example.com)"
+
+  echo "" >/dev/tty
+  info "acme_email is used by cert-manager to register a Let's Encrypt ACME account and issue the wildcard TLS certificate for your domain — registration fails without a real address." >/dev/tty
+  local azure_acme_email
+  ask_required azure_acme_email "ACME email"
+
+  echo "" >/dev/tty
+  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
+  info "This is a separate, optional choice about which service delivers app emails — unrelated to which cloud hosts the deployment. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
+  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
+  local use_own_email
+  read -r use_own_email </dev/tty
+  local email_provider="licensing"
+  local sendgrid_api_key="" sendgrid_from_email=""
+  local ses_aws_region="" aws_ses_access_key_id="" aws_ses_secret_access_key="" aws_ses_from_email=""
+  case "$use_own_email" in
+    y|Y|yes|Yes)
+      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
+      printf "Which provider? [1/2]: " >/dev/tty
+      local email_choice
+      read -r email_choice </dev/tty
+      case "$email_choice" in
+        1|sendgrid|SendGrid)
+          email_provider="sendgrid"
+          ask_required sendgrid_api_key "SendGrid API key" -s
+          ask_required sendgrid_from_email "SendGrid from-email"
+          ;;
+        2|ses|SES)
+          email_provider="ses"
+          printf "AWS SES region [us-east-1]: " >/dev/tty
+          read -r ses_aws_region </dev/tty
+          ses_aws_region="${ses_aws_region:-us-east-1}"
+          ask_required aws_ses_access_key_id "AWS access key ID"
+          ask_required aws_ses_secret_access_key "AWS secret access key" -s
+          ask_required aws_ses_from_email "SES from-email"
+          ;;
+        *) die "Invalid choice: $email_choice" ;;
+      esac
+      ;;
+    *) : ;;
+  esac
+
+  if [ -d "$AZURE_DEPLOY_DIR" ]; then
+    warn "${AZURE_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
+  else
+    info "Downloading terraform-azure-ekai…"
+    local tarball
+    tarball=$(mktemp)
+    curl -fsSL "$AZURE_REPO_TARBALL_URL" -o "$tarball"
+    mkdir -p "$AZURE_DEPLOY_DIR"
+    tar -xzf "$tarball" --strip-components=1 -C "$AZURE_DEPLOY_DIR"
+    rm -f "$tarball"
+    success "Downloaded terraform-azure-ekai"
+  fi
+
+  local tfvars_dir="${AZURE_DEPLOY_DIR}/env"
+  local tfvars_file="${tfvars_dir}/${azure_env}.tfvars"
+
+  if [ -f "$tfvars_file" ]; then
+    warn "${tfvars_file} already exists."
+    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
+    local overwrite
+    read -r overwrite </dev/tty
+    case "$overwrite" in
+      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_azure_run "$azure_env" "$azure_dns_zone"; return ;;
+      *) ;;
+    esac
+  fi
+
+  # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
+  # sed doesn't support it; it silently no-ops instead of erroring, which
+  # would leave every "customer" placeholder in place with no warning).
+  # Unlike AWS/GCP, several of these have no Terraform-side default at all
+  # (resource_group_name, cluster_name, log_analytics_workspace_name are all
+  # required variables -- see variables.tf) -- left un-substituted, every one
+  # of them would literally contain "customer" regardless of the env name
+  # just chosen, colliding with any other deployment in the same subscription.
+  sed \
+    -e "s/^subscription_id[[:space:]]*=[[:space:]]*\"00000000-0000-0000-0000-000000000000\"/subscription_id = \"${azure_subscription_id}\"/" \
+    -e "s/^region[[:space:]]*=[[:space:]]*\"northeurope\"/region          = \"${azure_region}\"/" \
+    -e "s/^env_name[[:space:]]*=[[:space:]]*\"customer\"/env_name = \"${azure_env}\"/" \
+    -e "s/^resource_group_name[[:space:]]*=[[:space:]]*\"ekai-saas-customer\"/resource_group_name = \"ekai-saas-${azure_env}\"/" \
+    -e "s/^cluster_name[[:space:]]*=[[:space:]]*\"ekai-saas-aks-customer\"/cluster_name    = \"ekai-saas-aks-${azure_env}\"/" \
+    -e "s/^log_analytics_workspace_name[[:space:]]*=[[:space:]]*\"ekaiaksworkspace-customer\"/log_analytics_workspace_name = \"ekaiaksworkspace-${azure_env}\"/" \
+    -e "s/^dns_zone[[:space:]]*=[[:space:]]*\"customer.ekai.ai\".*/dns_zone        = \"${azure_dns_zone}\"/" \
+    -e "s/^acme_email[[:space:]]*=[[:space:]]*\"devops@ekai.ai\"/acme_email = \"${azure_acme_email}\"/" \
+    "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
+
+  {
+    echo ""
+    echo "# Added by install.sh — deploy token + licensing portal, same values"
+    echo "# written to .env for the local Docker path."
+    echo "secret_value_overrides = {"
+    echo "  EKAI_DEPLOY_TOKEN         = \"${token}\""
+    echo "  EKAI_LICENSING_PORTAL_URL = \"${PORTAL_URL}\""
+    echo "  EMAIL_PROVIDER            = \"${email_provider}\""
+    case "$email_provider" in
+      sendgrid)
+        echo "  SENDGRID_API_KEY          = \"${sendgrid_api_key}\""
+        echo "  SENDGRID_FROM_EMAIL       = \"${sendgrid_from_email}\""
+        ;;
+      ses)
+        echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${aws_ses_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_ses_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        ;;
+    esac
+    echo "}"
+  } >> "$tfvars_file"
+  success "${tfvars_file} written"
+
+  deploy_azure_run "$azure_env" "$azure_dns_zone"
+}
+
+deploy_azure_run() {
+  local azure_env="$1"
+  local azure_dns_zone="$2"
+
+  echo ""
+  info "Ready to deploy to Azure (env=${azure_env})."
+  info "This runs terraform-azure-ekai/scripts/self-deploy.sh, which will:"
+  echo "  - register required Azure resource providers"
+  echo "  - create a scoped deployer Service Principal (Owner, scoped to one resource group)"
+  echo "  - run 2 terraform applies (creates real, billable Azure resources)"
+  # --skip-dns-wait: Azure's wildcard cert issuance is async (DNS-01 via
+  # cert-manager against the zone self-deploy.sh just created, not a
+  # synchronous ACM-style validation blocking the apply itself -- same as
+  # GCP, unlike AWS). Don't block this call on self-deploy.sh's interactive
+  # "press Enter once you've delegated DNS" prompt; the name servers are
+  # printed below instead, same place the GCP path surfaces them.
+  #
+  # >/dev/tty: self-deploy.sh has no tty redirects of its own -- same reason
+  # as the AWS path's call below.
+  ( cd "$AZURE_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$azure_env" ) >/dev/tty
+
+  # Mirrors deploy_aws_run's own portal_url check exactly. A non-empty
+  # portal_url is the signal the cicd apply actually completed; empty means
+  # nothing was deployed this run (declined the confirmation, or a failure
+  # before cicd ever ran).
+  local tf_err_file
+  tf_err_file=$(mktemp)
+
+  local portal_url_raw portal_url_err
+  portal_url_raw=$( (cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
+  portal_url_err=$(cat "$tf_err_file")
+  rm -f "$tf_err_file"
+
+  local name_servers
+  name_servers=$(cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -json dns_zone_name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
+
+  if [ -z "$portal_url_raw" ]; then
+    echo ""
+    warn "Terraform wasn't fully applied — nothing was deployed this run."
+    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
+      error "portal_url lookup failed:"
+      echo "$portal_url_err" >&2
+    fi
+    if [ -n "$name_servers" ]; then
+      echo ""
+      echo "  ${bold}Before ${azure_dns_zone} works:${reset} delegate it to these nameservers at your domain"
+      echo "  registrar (or parent DNS zone) — add an NS record for ${azure_dns_zone} pointing at each:"
+      echo "$name_servers" | sed 's/^/    /'
+      echo "  DNS propagation can take anywhere from a few minutes to a few hours."
+    fi
+    info "Re-run install.sh and choose retry for env '${azure_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
+    return
+  fi
+
+  echo ""
+  success "Ekai is running!"
+  echo ""
+  echo "  ${bold}Ekai:${reset}   ${portal_url_raw}"
+
+  # Unlike AWS (where name_servers are only shown in the not-deployed branch
+  # above), Azure's cicd apply can succeed even though DNS delegation is
+  # still outstanding -- the wildcard cert just sits unissued until it's
+  # done, same as GCP's own install.sh path. Worth restating here even
+  # though self-deploy.sh already printed this once during the run.
+  if [ -n "$name_servers" ]; then
+    echo ""
+    echo "  ${bold}Before ${azure_dns_zone} works:${reset} delegate it to these nameservers at your domain registrar"
+    echo "  (or parent DNS zone) — add an NS record for ${azure_dns_zone} pointing at each:"
+    echo "$name_servers" | sed 's/^/    /'
+    echo "  DNS propagation can take anywhere from a few minutes to a few hours. Until it's"
+    echo "  done, the wildcard TLS cert can't be issued either — the URL above will fail or"
+    echo "  show a certificate warning in the meantime."
+  fi
+
+  local argocd_url
+  argocd_url=$(cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -raw argocd_url 2>/dev/null || true)
+  if [ -n "$argocd_url" ]; then
+    echo ""
+    echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
+    echo "  (user: admin, password:"
+    echo "    cd ${AZURE_DEPLOY_DIR}/examples/self-deploy/root"
+    echo "    terraform output -raw argocd_admin_password_plaintext)"
+  fi
+  echo ""
+}
+
 deploy_cloud() {
   local token="$1"
   local provider="$2"
@@ -1702,6 +1971,36 @@ main() {
     esac
   fi
 
+  # Same check for a previous Azure run -- self-deploy.sh writes its
+  # generated-secrets artifact with the identical "-generated-secrets.txt"
+  # suffix AWS uses (both OUT_DIR/${ENV}-generated-secrets.txt), so
+  # detect_partial_deploy's AWS-shaped call works unchanged here too.
+  local partial_azure_env
+  partial_azure_env=$(detect_partial_deploy "$AZURE_DEPLOY_DIR" "-generated-secrets.txt")
+  if [ -n "$partial_azure_env" ]; then
+    echo "" >/dev/tty
+    warn "Found previous run artifacts for Azure env '${partial_azure_env}'." >/dev/tty
+    printf "Retry that deploy instead of starting a new one? [y/N] " >/dev/tty
+    local azure_resume_choice
+    read -r azure_resume_choice </dev/tty
+    case "$azure_resume_choice" in
+      y|Y|yes|Yes)
+        if check_azure_prereqs; then
+          local tfvars_dir="${AZURE_DEPLOY_DIR}/env"
+          local tfvars_file="${tfvars_dir}/${partial_azure_env}.tfvars"
+          local resume_dns_zone
+          resume_dns_zone=$(grep -E '^dns_zone[[:space:]]*=' "$tfvars_file" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/' || true)
+          deploy_azure_run "$partial_azure_env" "$resume_dns_zone"
+          return
+        else
+          echo ""
+          die "One or more Azure prerequisites are missing. Fix the issues above and re-run."
+        fi
+        ;;
+      *) info "Starting a new deployment." ;;
+    esac
+  fi
+
   # Deployment type
   local deploy_type
   deploy_type=$(ask_deployment_type)
@@ -1754,6 +2053,13 @@ main() {
       else
         echo ""
         die "One or more AWS prerequisites are missing. Fix the issues above and re-run."
+      fi
+    elif [ "$provider" = "azure" ]; then
+      if check_cloud_cli "$provider" && check_azure_prereqs; then
+        deploy_azure "$token"
+      else
+        echo ""
+        die "One or more Azure prerequisites are missing. Fix the issues above and re-run."
       fi
     else
       if check_cloud_cli "$provider"; then
