@@ -38,12 +38,29 @@ NORTHWIND_DB="northwind"
 NORTHWIND_USER="northwind"
 NORTHWIND_PASSWORD="northwind"
 PG_CONTAINER="ekai-postgres"
-GCP_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-google-ekai/archive/refs/heads/main.tar.gz"
-GCP_DEPLOY_DIR="terraform-google-ekai" # relative to cwd, downloaded below
-AWS_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-aws-ekai/archive/refs/heads/main.tar.gz"
-AWS_DEPLOY_DIR="terraform-aws-ekai" # relative to cwd, downloaded below
-AZURE_REPO_TARBALL_URL="https://github.com/ekai-ai/terraform-azure-ekai/archive/refs/heads/main.tar.gz"
-AZURE_DEPLOY_DIR="terraform-azure-ekai" # relative to cwd, downloaded below
+# All three self-service Terraform repos follow the same
+# terraform-<segment>-ekai naming -- GCP's repo says "google", not "gcp",
+# the one irregularity, so the provider->segment mapping is its own
+# one-line lookup rather than assuming the cloud name always matches.
+cloud_repo_segment() {
+  case "$1" in
+    gcp) echo "google" ;;
+    *)   echo "$1" ;;
+  esac
+}
+cloud_repo_tarball_url() {
+  echo "https://github.com/ekai-ai/terraform-$(cloud_repo_segment "$1")-ekai/archive/refs/heads/main.tar.gz"
+}
+cloud_deploy_dir() {
+  echo "terraform-$(cloud_repo_segment "$1")-ekai" # relative to cwd, downloaded below
+}
+
+GCP_REPO_TARBALL_URL=$(cloud_repo_tarball_url gcp)
+GCP_DEPLOY_DIR=$(cloud_deploy_dir gcp)
+AWS_REPO_TARBALL_URL=$(cloud_repo_tarball_url aws)
+AWS_DEPLOY_DIR=$(cloud_deploy_dir aws)
+AZURE_REPO_TARBALL_URL=$(cloud_repo_tarball_url azure)
+AZURE_DEPLOY_DIR=$(cloud_deploy_dir azure)
 
 # When run via `curl ... | bash`, this script's own stdin is a pipe, not a
 # real terminal -- and with the whole process tree rooted that way, deeply
@@ -834,6 +851,24 @@ check_cloud_cli() {
   return 0
 }
 
+# terraform/kubectl/jq/dig are needed by every cloud deploy path, identically
+# -- self-deploy.sh's cicd apply needs kubectl to auth against the cluster it
+# just created, jq to parse the cloud CLI's JSON output, and dig to poll DNS
+# propagation for the delegated zone. Only the cloud CLI itself (gcloud/aws/az)
+# and any CLI-specific plugin (gke-gcloud-auth-plugin) differ per cloud, so
+# each check_<cloud>_tools layers those around this shared core instead of
+# repeating the 4 identical `need` calls three times. Doesn't call
+# reset_missing_tools or offer_auto_install_missing_tools itself -- callers
+# that need to `need` a cloud CLI first (GCP) do so before/after this runs,
+# into the same _missing_tools accumulator, and offer the combined install in
+# one pass.
+need_common_cloud_tools() {
+  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
+  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
+  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
+  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
+}
+
 # Checks every tool the GCP deploy path needs (gcloud, terraform, kubectl,
 # gke-gcloud-auth-plugin, jq, dig), offers to auto-install whatever's missing,
 # and reports anything still missing afterward — all before asking any of
@@ -842,23 +877,13 @@ check_cloud_cli() {
 check_gcp_tools() {
   reset_missing_tools
   need gcloud "Install it from https://cloud.google.com/sdk/docs/install (on Windows, install it inside WSL following the Linux instructions)."
-  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
-  # self-deploy.sh's cicd apply needs `kubectl` to auth against the GKE
-  # cluster it just created — modern GKE requires this plugin for that
-  # rather than gcloud's older built-in auth, and kubectl fails with a
-  # cryptic error mid-deploy without it.
-  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
+  need_common_cloud_tools
   # gke-gcloud-auth-plugin is a gcloud component — installing it first
   # requires gcloud itself, so only attempt it once gcloud is confirmed
   # present (either found already, or just auto-installed above).
   if command -v gcloud &>/dev/null; then
     need gke-gcloud-auth-plugin "Install it with: gcloud components install gke-gcloud-auth-plugin"
   fi
-  # self-deploy.sh itself needs `jq` to parse gcloud/kubectl JSON output.
-  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
-  # self-deploy.sh polls DNS (via `dig`) to confirm the domain's name servers
-  # have propagated before continuing.
-  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
 
   offer_auto_install_missing_tools
 
@@ -1294,16 +1319,7 @@ deploy_gcp_run() {
 # of deploy_aws's region/env/dns_zone questions.
 check_aws_tools() {
   reset_missing_tools
-  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
-  # self-deploy.sh's cicd apply needs kubectl to auth against the EKS
-  # cluster it just created, same reason as the GCP path.
-  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
-  # self-deploy.sh itself needs jq to parse aws CLI JSON output.
-  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
-  # self-deploy.sh polls DNS (via dig) to confirm the domain's name servers
-  # have propagated before continuing.
-  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
-
+  need_common_cloud_tools
   offer_auto_install_missing_tools
 }
 
@@ -1612,16 +1628,7 @@ deploy_aws_run() {
 # error naming the resource group and principal).
 check_azure_tools() {
   reset_missing_tools
-  need terraform "Install it: see https://developer.hashicorp.com/terraform/install (on Windows, install it inside WSL following the Linux instructions)"
-  # self-deploy.sh's cicd apply needs kubectl to auth against the AKS
-  # cluster it just created, same reason as the AWS/GCP paths.
-  need kubectl "Install it: see https://kubernetes.io/docs/tasks/tools/ (on Windows, install it inside WSL following the Linux instructions)"
-  # self-deploy.sh itself needs jq to parse az CLI JSON output.
-  need jq "Install it with: brew install jq (macOS) or sudo apt install jq / sudo yum install jq (Linux) — on Windows, install it inside WSL following the Linux instructions."
-  # self-deploy.sh polls DNS (via dig) to confirm the domain's name servers
-  # have propagated before continuing.
-  need dig "Install it with: brew install bind (macOS) or sudo apt install dnsutils / sudo yum install bind-utils (Linux) — on Windows, install it inside WSL following the Linux instructions."
-
+  need_common_cloud_tools
   offer_auto_install_missing_tools
 }
 
