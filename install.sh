@@ -1051,6 +1051,55 @@ detect_partial_deploy() {
   echo "$env_name"
 }
 
+# Transactional email (invites, notifications sent by the app) is a separate,
+# optional choice from whichever cloud hosts the deployment -- byte-identical
+# across all three cloud paths, so asked once here instead of three times.
+# Sets email_provider ("licensing" | "sendgrid" | "ses") and, depending on
+# that, sendgrid_api_key/sendgrid_from_email or
+# ses_aws_region/ses_access_key_id/ses_secret_access_key/ses_from_email.
+# Deliberately not `local` to this function -- the caller declares those
+# `local` to itself first (so they don't leak past its own return) and this
+# assigns into that same instance, the same dynamic-scoping idiom
+# ask_required already relies on for a single output variable, used here for
+# several at once instead of threading seven separate nameref-style params.
+ask_email_provider() {
+  echo "" >/dev/tty
+  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
+  info "This is a separate, optional choice about which service delivers app emails — unrelated to which cloud hosts the deployment. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
+  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
+  local use_own_email
+  read -r use_own_email </dev/tty
+  email_provider="licensing"
+  sendgrid_api_key="" sendgrid_from_email=""
+  ses_aws_region="" ses_access_key_id="" ses_secret_access_key="" ses_from_email=""
+  case "$use_own_email" in
+    y|Y|yes|Yes)
+      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
+      printf "Which provider? [1/2]: " >/dev/tty
+      local email_choice
+      read -r email_choice </dev/tty
+      case "$email_choice" in
+        1|sendgrid|SendGrid)
+          email_provider="sendgrid"
+          ask_required sendgrid_api_key "SendGrid API key" -s
+          ask_required sendgrid_from_email "SendGrid from-email"
+          ;;
+        2|ses|SES)
+          email_provider="ses"
+          printf "AWS SES region [us-east-1]: " >/dev/tty
+          read -r ses_aws_region </dev/tty
+          ses_aws_region="${ses_aws_region:-us-east-1}"
+          ask_required ses_access_key_id "AWS access key ID"
+          ask_required ses_secret_access_key "AWS secret access key" -s
+          ask_required ses_from_email "SES from-email"
+          ;;
+        *) die "Invalid choice: $email_choice" ;;
+      esac
+      ;;
+    *) : ;;
+  esac
+}
+
 deploy_gcp() {
   local token="$1"
 
@@ -1092,41 +1141,9 @@ deploy_gcp() {
   local gcp_acme_email
   ask_required gcp_acme_email "ACME email"
 
-  echo "" >/dev/tty
-  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
-  info "Unrelated to the ACME/TLS setup above — this is a separate, optional choice about which service delivers app emails. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
-  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
-  local use_own_email
-  read -r use_own_email </dev/tty
-  local email_provider="licensing"
-  local sendgrid_api_key="" sendgrid_from_email=""
-  local ses_aws_region="" aws_access_key_id="" aws_secret_access_key="" aws_ses_from_email=""
-  case "$use_own_email" in
-    y|Y|yes|Yes)
-      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
-      printf "Which provider? [1/2]: " >/dev/tty
-      local email_choice
-      read -r email_choice </dev/tty
-      case "$email_choice" in
-        1|sendgrid|SendGrid)
-          email_provider="sendgrid"
-          ask_required sendgrid_api_key "SendGrid API key" -s
-          ask_required sendgrid_from_email "SendGrid from-email"
-          ;;
-        2|ses|SES)
-          email_provider="ses"
-          printf "AWS SES region [us-east-1]: " >/dev/tty
-          read -r ses_aws_region </dev/tty
-          ses_aws_region="${ses_aws_region:-us-east-1}"
-          ask_required aws_access_key_id "AWS access key ID"
-          ask_required aws_secret_access_key "AWS secret access key" -s
-          ask_required aws_ses_from_email "SES from-email"
-          ;;
-        *) die "Invalid choice: $email_choice" ;;
-      esac
-      ;;
-    *) : ;;
-  esac
+  local email_provider sendgrid_api_key sendgrid_from_email
+  local ses_aws_region ses_access_key_id ses_secret_access_key ses_from_email
+  ask_email_provider
 
   if [ -d "$GCP_DEPLOY_DIR" ]; then
     warn "${GCP_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
@@ -1183,9 +1200,9 @@ deploy_gcp() {
         ;;
       ses)
         echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
-        echo "  AWS_ACCESS_KEY_ID         = \"${aws_access_key_id}\""
-        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_secret_access_key}\""
-        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${ses_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${ses_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${ses_from_email}\""
         ;;
     esac
     echo "}"
@@ -1442,41 +1459,9 @@ deploy_aws() {
   local aws_dns_zone
   ask_required aws_dns_zone "DNS zone (e.g. example.com)"
 
-  echo "" >/dev/tty
-  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
-  info "This is a separate, optional choice about which service delivers app emails — unrelated to which cloud hosts the deployment. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
-  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
-  local use_own_email
-  read -r use_own_email </dev/tty
-  local email_provider="licensing"
-  local sendgrid_api_key="" sendgrid_from_email=""
-  local ses_aws_region="" aws_ses_access_key_id="" aws_ses_secret_access_key="" aws_ses_from_email=""
-  case "$use_own_email" in
-    y|Y|yes|Yes)
-      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
-      printf "Which provider? [1/2]: " >/dev/tty
-      local email_choice
-      read -r email_choice </dev/tty
-      case "$email_choice" in
-        1|sendgrid|SendGrid)
-          email_provider="sendgrid"
-          ask_required sendgrid_api_key "SendGrid API key" -s
-          ask_required sendgrid_from_email "SendGrid from-email"
-          ;;
-        2|ses|SES)
-          email_provider="ses"
-          printf "AWS SES region [us-east-1]: " >/dev/tty
-          read -r ses_aws_region </dev/tty
-          ses_aws_region="${ses_aws_region:-us-east-1}"
-          ask_required aws_ses_access_key_id "AWS access key ID"
-          ask_required aws_ses_secret_access_key "AWS secret access key" -s
-          ask_required aws_ses_from_email "SES from-email"
-          ;;
-        *) die "Invalid choice: $email_choice" ;;
-      esac
-      ;;
-    *) : ;;
-  esac
+  local email_provider sendgrid_api_key sendgrid_from_email
+  local ses_aws_region ses_access_key_id ses_secret_access_key ses_from_email
+  ask_email_provider
 
   if [ -d "$AWS_DEPLOY_DIR" ]; then
     warn "${AWS_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
@@ -1529,9 +1514,9 @@ deploy_aws() {
         ;;
       ses)
         echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
-        echo "  AWS_ACCESS_KEY_ID         = \"${aws_ses_access_key_id}\""
-        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_ses_secret_access_key}\""
-        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${ses_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${ses_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${ses_from_email}\""
         ;;
     esac
     echo "}"
@@ -1689,41 +1674,9 @@ deploy_azure() {
   local azure_acme_email
   ask_required azure_acme_email "ACME email"
 
-  echo "" >/dev/tty
-  echo "${bold}Transactional email (invites, notifications sent by the app)${reset}" >/dev/tty
-  info "This is a separate, optional choice about which service delivers app emails — unrelated to which cloud hosts the deployment. By default, Ekai's own licensing portal sends these for you, no setup needed." >/dev/tty
-  printf "Provide your own SendGrid or AWS SES credentials for this? [y/N]: " >/dev/tty
-  local use_own_email
-  read -r use_own_email </dev/tty
-  local email_provider="licensing"
-  local sendgrid_api_key="" sendgrid_from_email=""
-  local ses_aws_region="" aws_ses_access_key_id="" aws_ses_secret_access_key="" aws_ses_from_email=""
-  case "$use_own_email" in
-    y|Y|yes|Yes)
-      printf "  1) SendGrid\n  2) AWS SES\n" >/dev/tty
-      printf "Which provider? [1/2]: " >/dev/tty
-      local email_choice
-      read -r email_choice </dev/tty
-      case "$email_choice" in
-        1|sendgrid|SendGrid)
-          email_provider="sendgrid"
-          ask_required sendgrid_api_key "SendGrid API key" -s
-          ask_required sendgrid_from_email "SendGrid from-email"
-          ;;
-        2|ses|SES)
-          email_provider="ses"
-          printf "AWS SES region [us-east-1]: " >/dev/tty
-          read -r ses_aws_region </dev/tty
-          ses_aws_region="${ses_aws_region:-us-east-1}"
-          ask_required aws_ses_access_key_id "AWS access key ID"
-          ask_required aws_ses_secret_access_key "AWS secret access key" -s
-          ask_required aws_ses_from_email "SES from-email"
-          ;;
-        *) die "Invalid choice: $email_choice" ;;
-      esac
-      ;;
-    *) : ;;
-  esac
+  local email_provider sendgrid_api_key sendgrid_from_email
+  local ses_aws_region ses_access_key_id ses_secret_access_key ses_from_email
+  ask_email_provider
 
   if [ -d "$AZURE_DEPLOY_DIR" ]; then
     warn "${AZURE_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
@@ -1778,6 +1731,10 @@ deploy_azure() {
     echo "secret_value_overrides = {"
     echo "  EKAI_DEPLOY_TOKEN         = \"${token}\""
     echo "  EKAI_LICENSING_PORTAL_URL = \"${PORTAL_URL}\""
+    # Azure isn't AWS -- same reason the GCP path sets this -- so the
+    # ai-core CloudWatch loader doesn't try (and fail) to init against a
+    # real AWS account this deployment has no relationship with.
+    echo "  SKIP_CLOUDWATCH           = \"true\""
     echo "  EMAIL_PROVIDER            = \"${email_provider}\""
     case "$email_provider" in
       sendgrid)
@@ -1786,9 +1743,9 @@ deploy_azure() {
         ;;
       ses)
         echo "  SES_AWS_REGION            = \"${ses_aws_region}\""
-        echo "  AWS_ACCESS_KEY_ID         = \"${aws_ses_access_key_id}\""
-        echo "  AWS_SECRET_ACCESS_KEY     = \"${aws_ses_secret_access_key}\""
-        echo "  AWS_SES_FROM_EMAIL        = \"${aws_ses_from_email}\""
+        echo "  AWS_ACCESS_KEY_ID         = \"${ses_access_key_id}\""
+        echo "  AWS_SECRET_ACCESS_KEY     = \"${ses_secret_access_key}\""
+        echo "  AWS_SES_FROM_EMAIL        = \"${ses_from_email}\""
         ;;
     esac
     echo "}"
