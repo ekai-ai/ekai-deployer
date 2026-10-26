@@ -1161,16 +1161,7 @@ deploy_gcp() {
   local tfvars_dir="${GCP_DEPLOY_DIR}/env"
   local tfvars_file="${tfvars_dir}/${gcp_env}.tfvars"
 
-  if [ -f "$tfvars_file" ]; then
-    warn "${tfvars_file} already exists."
-    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
-    local overwrite
-    read -r overwrite </dev/tty
-    case "$overwrite" in
-      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone"; return ;;
-      *) ;;
-    esac
-  fi
+  check_tfvars_overwrite "$tfvars_file" deploy_gcp_run "$gcp_project_id" "$gcp_env" "$gcp_dns_zone" || return
 
   # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
   # sed doesn't support it; it silently no-ops instead of erroring, which
@@ -1410,6 +1401,35 @@ report_aws_azure_style_result() {
   echo ""
 }
 
+# Shared across all three deploy_<cloud> functions: if tfvars_file already
+# exists, ask whether to keep it (calling the cloud's own *_run resume
+# function with the given args and signaling the caller to `return`) or
+# overwrite it (signaling the caller to fall through and regenerate it as
+# usual). Identical everywhere except which resume function to call and
+# what arguments it takes -- GCP's deploy_gcp_run takes 3
+# (project_id/env/dns_zone), AWS/Azure's take 2 (env/dns_zone) -- so the
+# resume function's name and args are passed through rather than hardcoded.
+#
+# Args: $1 tfvars_file  $2 resume_fn_name  $3.. args to pass resume_fn_name
+# Usage: check_tfvars_overwrite "$tfvars_file" deploy_aws_run "$aws_env" "$aws_dns_zone" || return
+check_tfvars_overwrite() {
+  local tfvars_file="$1" resume_fn="$2"
+  shift 2
+  [ -f "$tfvars_file" ] || return 0
+  warn "${tfvars_file} already exists."
+  printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
+  local overwrite
+  read -r overwrite </dev/tty
+  case "$overwrite" in
+    n|N|no|No)
+      info "Keeping existing ${tfvars_file}."
+      "$resume_fn" "$@"
+      return 1
+      ;;
+    *) return 0 ;;
+  esac
+}
+
 # ── AWS deployment ────────────────────────────────────────────────────────────
 # Checks every tool terraform-aws-ekai's self-deploy.sh needs (terraform,
 # kubectl, jq, dig — no gcloud/gke-gcloud-auth-plugin equivalent: EKS auth
@@ -1562,16 +1582,7 @@ deploy_aws() {
   local tfvars_dir="${AWS_DEPLOY_DIR}/env"
   local tfvars_file="${tfvars_dir}/${aws_env}.tfvars"
 
-  if [ -f "$tfvars_file" ]; then
-    warn "${tfvars_file} already exists."
-    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
-    local overwrite
-    read -r overwrite </dev/tty
-    case "$overwrite" in
-      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_aws_run "$aws_env" "$aws_dns_zone"; return ;;
-      *) ;;
-    esac
-  fi
+  check_tfvars_overwrite "$tfvars_file" deploy_aws_run "$aws_env" "$aws_dns_zone" || return
 
   # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
   # sed doesn't support it; it silently no-ops instead of erroring, which
@@ -1730,16 +1741,7 @@ deploy_azure() {
   local tfvars_dir="${AZURE_DEPLOY_DIR}/env"
   local tfvars_file="${tfvars_dir}/${azure_env}.tfvars"
 
-  if [ -f "$tfvars_file" ]; then
-    warn "${tfvars_file} already exists."
-    printf "Overwrite it with the values just entered? [Y/n]: " >/dev/tty
-    local overwrite
-    read -r overwrite </dev/tty
-    case "$overwrite" in
-      n|N|no|No) info "Keeping existing ${tfvars_file}."; deploy_azure_run "$azure_env" "$azure_dns_zone"; return ;;
-      *) ;;
-    esac
-  fi
+  check_tfvars_overwrite "$tfvars_file" deploy_azure_run "$azure_env" "$azure_dns_zone" || return
 
   # Anchored, literal substitutions only — no \b word-boundary (BSD/macOS
   # sed doesn't support it; it silently no-ops instead of erroring, which
