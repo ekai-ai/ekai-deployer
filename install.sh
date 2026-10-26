@@ -1327,6 +1327,89 @@ deploy_gcp_run() {
   echo ""
 }
 
+# Shared final-report logic for AWS's and Azure's deploy_*_run: once
+# self-deploy.sh returns, read portal_url/name_servers/argocd_url from the
+# already-applied Terraform state and print either "nothing was deployed" or
+# the success summary. Their structure is byte-identical once
+# dir/env/dns_zone/output-name/show-dns-on-success are factored out.
+#
+# GCP stays separate, not folded into this -- it needs a
+# GOOGLE_APPLICATION_CREDENTIALS wrapper on every `terraform output` call
+# (its state bucket's IAM is scoped to the deployer key, not the installing
+# user's own gcloud auth), reports an extra ingress IP, and falls back to a
+# constructed portal URL when the real one can't be read. Forcing those into
+# this function would need several more parameters for behavior only GCP
+# has, trading today's duplication for a harder-to-read shared function.
+#
+# Args: $1 deploy_dir  $2 env_name  $3 dns_zone
+#       $4 name_servers_output -- the Terraform output name for the zone's
+#          nameservers (differs per cloud: route53_name_servers for AWS,
+#          dns_zone_name_servers for Azure)
+#       $5 show_dns_on_success -- "1" to repeat the DNS-delegation reminder
+#          even when the deploy succeeded (Azure's wildcard cert issuance is
+#          async like GCP's, so delegation can still be outstanding after a
+#          "successful" apply); "0" for AWS, whose synchronous ACM
+#          validation means a successful apply already implies DNS was fine
+report_aws_azure_style_result() {
+  local deploy_dir="$1" env_name="$2" dns_zone="$3"
+  local name_servers_output="$4" show_dns_on_success="$5"
+
+  local tf_err_file
+  tf_err_file=$(mktemp)
+
+  local portal_url_raw portal_url_err
+  portal_url_raw=$( (cd "${deploy_dir}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
+  portal_url_err=$(cat "$tf_err_file")
+  rm -f "$tf_err_file"
+
+  local name_servers
+  name_servers=$(cd "${deploy_dir}/examples/self-deploy/root" && terraform output -json "$name_servers_output" 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
+
+  if [ -z "$portal_url_raw" ]; then
+    echo ""
+    warn "Terraform wasn't fully applied — nothing was deployed this run."
+    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
+      error "portal_url lookup failed:"
+      echo "$portal_url_err" >&2
+    fi
+    if [ -n "$name_servers" ]; then
+      echo ""
+      echo "  ${bold}Before ${dns_zone} works:${reset} delegate it to these nameservers at your domain"
+      echo "  registrar (or parent DNS zone) — add an NS record for ${dns_zone} pointing at each:"
+      echo "$name_servers" | sed 's/^/    /'
+      echo "  DNS propagation can take anywhere from a few minutes to a few hours."
+    fi
+    info "Re-run install.sh and choose retry for env '${env_name}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
+    return 1
+  fi
+
+  echo ""
+  success "Ekai is running!"
+  echo ""
+  echo "  ${bold}Ekai:${reset}   ${portal_url_raw}"
+
+  if [ "$show_dns_on_success" = "1" ] && [ -n "$name_servers" ]; then
+    echo ""
+    echo "  ${bold}Before ${dns_zone} works:${reset} delegate it to these nameservers at your domain registrar"
+    echo "  (or parent DNS zone) — add an NS record for ${dns_zone} pointing at each:"
+    echo "$name_servers" | sed 's/^/    /'
+    echo "  DNS propagation can take anywhere from a few minutes to a few hours. Until it's"
+    echo "  done, the wildcard TLS cert can't be issued either — the URL above will fail or"
+    echo "  show a certificate warning in the meantime."
+  fi
+
+  local argocd_url
+  argocd_url=$(cd "${deploy_dir}/examples/self-deploy/root" && terraform output -raw argocd_url 2>/dev/null || true)
+  if [ -n "$argocd_url" ]; then
+    echo ""
+    echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
+    echo "  (user: admin, password:"
+    echo "    cd ${deploy_dir}/examples/self-deploy/root"
+    echo "    terraform output -raw argocd_admin_password_plaintext)"
+  fi
+  echo ""
+}
+
 # ── AWS deployment ────────────────────────────────────────────────────────────
 # Checks every tool terraform-aws-ekai's self-deploy.sh needs (terraform,
 # kubectl, jq, dig — no gcloud/gke-gcloud-auth-plugin equivalent: EKS auth
@@ -1550,54 +1633,7 @@ deploy_aws_run() {
   # self-deploy.sh's own behavior for anyone running it directly.
   ( cd "$AWS_DEPLOY_DIR" && ./scripts/self-deploy.sh "$aws_env" ) >/dev/tty
 
-  # Mirrors deploy_gcp_run's own portal_url check exactly. A non-empty
-  # portal_url is the signal the cicd apply actually completed; empty means
-  # nothing was deployed this run (declined the confirmation, or a failure
-  # before cicd ever ran).
-  local tf_err_file
-  tf_err_file=$(mktemp)
-
-  local portal_url_raw portal_url_err
-  portal_url_raw=$( (cd "${AWS_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
-  portal_url_err=$(cat "$tf_err_file")
-  rm -f "$tf_err_file"
-
-  local name_servers
-  name_servers=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -json route53_name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
-
-  if [ -z "$portal_url_raw" ]; then
-    echo ""
-    warn "Terraform wasn't fully applied — nothing was deployed this run."
-    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
-      error "portal_url lookup failed:"
-      echo "$portal_url_err" >&2
-    fi
-    if [ -n "$name_servers" ]; then
-      echo ""
-      echo "  ${bold}Before ${aws_dns_zone} works:${reset} delegate it to these nameservers at your domain"
-      echo "  registrar (or parent DNS zone) — add an NS record for ${aws_dns_zone} pointing at each:"
-      echo "$name_servers" | sed 's/^/    /'
-      echo "  DNS propagation can take anywhere from a few minutes to a few hours."
-    fi
-    info "Re-run install.sh and choose retry for env '${aws_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
-    return
-  fi
-
-  echo ""
-  success "Ekai is running!"
-  echo ""
-  echo "  ${bold}Ekai:${reset}   ${portal_url_raw}"
-
-  local argocd_url
-  argocd_url=$(cd "${AWS_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -raw argocd_url 2>/dev/null || true)
-  if [ -n "$argocd_url" ]; then
-    echo ""
-    echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
-    echo "  (user: admin, password:"
-    echo "    cd ${AWS_DEPLOY_DIR}/examples/self-deploy/root"
-    echo "    terraform output -raw argocd_admin_password_plaintext)"
-  fi
-  echo ""
+  report_aws_azure_style_result "$AWS_DEPLOY_DIR" "$aws_env" "$aws_dns_zone" "route53_name_servers" "0"
 }
 
 # ── Azure deployment ──────────────────────────────────────────────────────────
@@ -1776,69 +1812,7 @@ deploy_azure_run() {
   # as the AWS path's call below.
   ( cd "$AZURE_DEPLOY_DIR" && ./scripts/self-deploy.sh --skip-dns-wait "$azure_env" ) >/dev/tty
 
-  # Mirrors deploy_aws_run's own portal_url check exactly. A non-empty
-  # portal_url is the signal the cicd apply actually completed; empty means
-  # nothing was deployed this run (declined the confirmation, or a failure
-  # before cicd ever ran).
-  local tf_err_file
-  tf_err_file=$(mktemp)
-
-  local portal_url_raw portal_url_err
-  portal_url_raw=$( (cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/cicd" && terraform output -raw portal_url) 2>"$tf_err_file" || true)
-  portal_url_err=$(cat "$tf_err_file")
-  rm -f "$tf_err_file"
-
-  local name_servers
-  name_servers=$(cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -json dns_zone_name_servers 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)
-
-  if [ -z "$portal_url_raw" ]; then
-    echo ""
-    warn "Terraform wasn't fully applied — nothing was deployed this run."
-    if [ -n "$portal_url_err" ] && ! echo "$portal_url_err" | grep -q "Output \"portal_url\" not found\|No state file\|Backend initialization required"; then
-      error "portal_url lookup failed:"
-      echo "$portal_url_err" >&2
-    fi
-    if [ -n "$name_servers" ]; then
-      echo ""
-      echo "  ${bold}Before ${azure_dns_zone} works:${reset} delegate it to these nameservers at your domain"
-      echo "  registrar (or parent DNS zone) — add an NS record for ${azure_dns_zone} pointing at each:"
-      echo "$name_servers" | sed 's/^/    /'
-      echo "  DNS propagation can take anywhere from a few minutes to a few hours."
-    fi
-    info "Re-run install.sh and choose retry for env '${azure_env}' to continue, answering yes when self-deploy.sh asks to run the Terraform deploy."
-    return
-  fi
-
-  echo ""
-  success "Ekai is running!"
-  echo ""
-  echo "  ${bold}Ekai:${reset}   ${portal_url_raw}"
-
-  # Unlike AWS (where name_servers are only shown in the not-deployed branch
-  # above), Azure's cicd apply can succeed even though DNS delegation is
-  # still outstanding -- the wildcard cert just sits unissued until it's
-  # done, same as GCP's own install.sh path. Worth restating here even
-  # though self-deploy.sh already printed this once during the run.
-  if [ -n "$name_servers" ]; then
-    echo ""
-    echo "  ${bold}Before ${azure_dns_zone} works:${reset} delegate it to these nameservers at your domain registrar"
-    echo "  (or parent DNS zone) — add an NS record for ${azure_dns_zone} pointing at each:"
-    echo "$name_servers" | sed 's/^/    /'
-    echo "  DNS propagation can take anywhere from a few minutes to a few hours. Until it's"
-    echo "  done, the wildcard TLS cert can't be issued either — the URL above will fail or"
-    echo "  show a certificate warning in the meantime."
-  fi
-
-  local argocd_url
-  argocd_url=$(cd "${AZURE_DEPLOY_DIR}/examples/self-deploy/root" && terraform output -raw argocd_url 2>/dev/null || true)
-  if [ -n "$argocd_url" ]; then
-    echo ""
-    echo "  ${bold}ArgoCD:${reset} ${argocd_url}"
-    echo "  (user: admin, password:"
-    echo "    cd ${AZURE_DEPLOY_DIR}/examples/self-deploy/root"
-    echo "    terraform output -raw argocd_admin_password_plaintext)"
-  fi
-  echo ""
+  report_aws_azure_style_result "$AZURE_DEPLOY_DIR" "$azure_env" "$azure_dns_zone" "dns_zone_name_servers" "1"
 }
 
 deploy_cloud() {
