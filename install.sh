@@ -1642,8 +1642,13 @@ deploy_azure() {
 
   echo "" >/dev/tty
   info "Your Azure subscription ID -- everything this creates (resource group, AKS, Postgres, ...) lives inside this one subscription." >/dev/tty
-  local azure_subscription_id
-  ask_required azure_subscription_id "Azure subscription ID"
+  local azure_subscription_id=""
+  while :; do
+    ask_required azure_subscription_id "Azure subscription ID"
+    [[ "$azure_subscription_id" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]] && break
+    warn "\"${azure_subscription_id}\" doesn't look like a subscription ID (expected a GUID, e.g. 00000000-0000-0000-0000-000000000000) — check for typos." >/dev/tty
+    azure_subscription_id=""
+  done
 
   printf "Azure region [northeurope]: " >/dev/tty
   local azure_region
