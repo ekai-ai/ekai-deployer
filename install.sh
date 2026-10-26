@@ -1673,6 +1673,9 @@ deploy_azure() {
     elif [[ ! "$azure_env" =~ ^[a-z0-9]+$ ]]; then
       printf "Environment name must be lowercase letters and numbers only (the state storage account name can't contain anything else): " >/dev/tty
       azure_env=""
+    elif az group show --name "ekai-saas-${azure_env}" --subscription "$azure_subscription_id" &>/dev/null; then
+      warn "A resource group named \"ekai-saas-${azure_env}\" already exists in this subscription -- Azure env names must be unique within it. If this is yours from a previous run, Ctrl-C and re-run install.sh to pick up the \"retry that deploy\" prompt instead; otherwise pick a different name." >/dev/tty
+      azure_env=""
     fi
   done
 
