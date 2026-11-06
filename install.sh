@@ -40,12 +40,16 @@ NORTHWIND_PASSWORD="northwind"
 PG_CONTAINER="ekai-postgres"
 # All three self-service Terraform repos follow the same
 # terraform-<segment>-ekai naming -- GCP's repo says "google", not "gcp",
-# the one irregularity, so the provider->segment mapping is its own
-# one-line lookup rather than assuming the cloud name always matches.
+# and Azure's says "azurerm" (the real Terraform provider name), not
+# "azure" -- the Terraform Registry derives a module's provider strictly
+# from this same repo-name segment, so this isn't just cosmetic -- so the
+# provider->segment mapping is its own one-line lookup rather than
+# assuming the cloud name always matches the repo name.
 cloud_repo_segment() {
   case "$1" in
-    gcp) echo "google" ;;
-    *)   echo "$1" ;;
+    gcp)   echo "google" ;;
+    azure) echo "azurerm" ;;
+    *)     echo "$1" ;;
   esac
 }
 cloud_repo_tarball_url() {
@@ -1648,14 +1652,15 @@ deploy_aws_run() {
 }
 
 # ── Azure deployment ──────────────────────────────────────────────────────────
-# Checks every tool terraform-azure-ekai's self-deploy.sh needs (terraform,
+# Checks every tool terraform-azurerm-ekai's self-deploy.sh needs (terraform,
 # kubectl, jq, dig -- no gcloud/gke-gcloud-auth-plugin equivalent: AKS auth
 # goes through the az CLI directly via `az aks get-credentials`, same as the
 # AWS path's own `aws`-direct EKS auth). No dedicated check_azure_permissions
 # pre-check exists yet (unlike AWS's iam:SimulatePrincipalPolicy / GCP's
-# testIamPermissions) -- terraform-azure-ekai has no PERMISSIONS.md to point
-# a failure message at yet either. self-deploy.sh still fails clearly on its
-# own if the authenticated identity lacks subscription-level rights (it
+# testIamPermissions) -- terraform-azurerm-ekai's PERMISSIONS.md documents
+# the requirement, but nothing here surfaces it on a failure. self-deploy.sh
+# still fails clearly on its own if the authenticated identity lacks
+# subscription-level rights (it
 # retries the Owner role-assignment grant 5 times, then dies with a specific
 # error naming the resource group and principal).
 check_azure_tools() {
@@ -1728,14 +1733,14 @@ deploy_azure() {
   if [ -d "$AZURE_DEPLOY_DIR" ]; then
     warn "${AZURE_DEPLOY_DIR} already exists — reusing it as-is (no auto-update). Delete it first for a fresh checkout."
   else
-    info "Downloading terraform-azure-ekai…"
+    info "Downloading terraform-azurerm-ekai…"
     local tarball
     tarball=$(mktemp)
     curl -fsSL "$AZURE_REPO_TARBALL_URL" -o "$tarball"
     mkdir -p "$AZURE_DEPLOY_DIR"
     tar -xzf "$tarball" --strip-components=1 -C "$AZURE_DEPLOY_DIR"
     rm -f "$tarball"
-    success "Downloaded terraform-azure-ekai"
+    success "Downloaded terraform-azurerm-ekai"
   fi
 
   local tfvars_dir="${AZURE_DEPLOY_DIR}/env"
@@ -1799,7 +1804,7 @@ deploy_azure_run() {
 
   echo ""
   info "Ready to deploy to Azure (env=${azure_env})."
-  info "This runs terraform-azure-ekai/scripts/self-deploy.sh, which will:"
+  info "This runs terraform-azurerm-ekai/scripts/self-deploy.sh, which will:"
   echo "  - register required Azure resource providers"
   echo "  - create a scoped deployer Service Principal (Owner, scoped to one resource group)"
   echo "  - run 2 terraform applies (creates real, billable Azure resources)"
