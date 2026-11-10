@@ -1764,7 +1764,7 @@ deploy_azure() {
     -e "s/^cluster_name[[:space:]]*=[[:space:]]*\"ekai-saas-aks-customer\"/cluster_name    = \"ekai-saas-aks-${azure_env}\"/" \
     -e "s/^log_analytics_workspace_name[[:space:]]*=[[:space:]]*\"ekaiaksworkspace-customer\"/log_analytics_workspace_name = \"ekaiaksworkspace-${azure_env}\"/" \
     -e "s/^dns_zone[[:space:]]*=[[:space:]]*\"customer.ekai.ai\".*/dns_zone        = \"${azure_dns_zone}\"/" \
-    -e "s/^acme_email[[:space:]]*=[[:space:]]*\"devops@ekai.ai\"/acme_email = \"${azure_acme_email}\"/" \
+    -e "s/^acme_email[[:space:]]*=[[:space:]]*\"REPLACE_ME\"/acme_email = \"${azure_acme_email}\"/" \
     "${tfvars_dir}/customer.tfvars" > "$tfvars_file"
 
   {
