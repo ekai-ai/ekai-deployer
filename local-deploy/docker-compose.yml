@@ -85,7 +85,7 @@ services:
   # ─── AI-Core app ─────────────────────────────────────────────────────────────
 
   ekai-erd:
-    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    platform: ${DOCKER_PLATFORM:-}
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-erd:dev
     container_name: ekai-erd
     ports:
@@ -111,7 +111,7 @@ services:
     restart: unless-stopped
 
   ekai-ai-core-worker:
-    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    platform: ${DOCKER_PLATFORM:-}
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-erd:dev
     container_name: ekai-ai-core-worker
     entrypoint:
@@ -152,7 +152,7 @@ services:
     restart: unless-stopped
 
   ekai-mcp:
-    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    platform: ${DOCKER_PLATFORM:-}
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-erd:dev
     container_name: ekai-mcp
     entrypoint:
@@ -177,7 +177,7 @@ services:
     restart: unless-stopped
 
   ekai-document-worker:
-    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    platform: ${DOCKER_PLATFORM:-}
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-document-worker:dev
     container_name: ekai-document-worker
     env_file:
@@ -206,7 +206,7 @@ services:
     restart: unless-stopped
 
   ekai-profile-worker:
-    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    platform: ${DOCKER_PLATFORM:-}
     image: public.ecr.aws/s7m9t1b0/ekai/ekai-profile-worker:dev
     env_file:
       - .env
